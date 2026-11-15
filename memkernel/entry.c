@@ -15,7 +15,7 @@
 #include "comm.h"
 #include "memory.h"
 
-#define DEVICE_NAME "phmeop"
+#define DEVICE_NAME "oplus_bsp_state"
 
 static DEFINE_MUTEX(driver_mutex);
 
@@ -70,22 +70,22 @@ static struct miscdevice misc = {
 	.fops = &dispatch_functions,
 };
 
-int __init memkernel_entry(void)
+int __init oplus_bsp_dfr_state_init(void)
 {
 	int ret;
-	printk("[+] memkernel_entry");
+	printk("[+] oplus_bsp_dfr_state_init");
 	ret = misc_register(&misc);
 	return ret;
 }
 
-void __exit memkernel_unload(void)
+void __exit oplus_bsp_dfr_state_exit(void)
 {
-	printk("[+] memkernel_unload");
+	printk("[+] oplus_bsp_dfr_state_exit");
 	misc_deregister(&misc);
 }
 
-module_init(memkernel_entry);
-module_exit(memkernel_unload);
+module_init(oplus_bsp_dfr_state_init);
+module_exit(oplus_bsp_dfr_state_exit);
 
 MODULE_DESCRIPTION("Linux Kernel.");
 MODULE_LICENSE("GPL");
