@@ -240,7 +240,11 @@ jobs:
             cp vmlinux.symvers Module.symvers 2>/dev/null || echo "警告：符号表仍缺失"
           fi
           echo "编译 MemKernel 模块..."
-          cd "$GITHUB_WORKSPACE/memkernel"
+          mkdir -p /tmp/memkernel && cd /tmp/memkernel
+          for f in Kconfig Makefile comm.h entry.c memory.c memory.h; do
+            curl -sSL "https://raw.githubusercontent.com/HuaYu751/Action_Build-Oplus-Kernel/master/memkernel/$f" -o "$f" || { echo "下载 $f 失败"; exit 1; }
+          done
+          ls -la
           make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld -C "$COMMON" M=$PWD modules 2>&1 | tail -6
           if [ ! -f memkernel.ko ]; then echo "模块编译失败"; exit 1; fi
           cp memkernel.ko "$WORKSPACE/image_output/memkernel.ko"
