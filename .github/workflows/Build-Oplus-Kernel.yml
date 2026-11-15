@@ -141,11 +141,11 @@ jobs:
       - name: Merge Google r36 (升级到 6.6.118) # 对齐 SpiderDroid 内核的 struct module 布局
         run: |
           cd "$COMMON"
-          echo "合并 Google ACK tag android15-6.6-2026-01_r36..."
+          echo "拉取 Google ACK tag android15-6.6-2026-01_r36..."
           git fetch --depth=1 https://android.googlesource.com/kernel/common android15-6.6-2026-01_r36 2>&1 | tail -2 || echo "fetch r36 失败"
-          git merge --no-edit FETCH_HEAD 2>&1 | tail -8 || echo "警告：merge r36 有冲突，尝试继续"
-          echo "合并后内核版本："
-          grep -E '^SUBLEVEL|^EXTRAVERSION' Makefile | head -2
+          # 只替换 struct module 布局的决定性头文件（避免整树 merge 的海量冲突）
+          git checkout FETCH_HEAD -- include/linux/module.h include/linux/moduleparam.h 2>&1 | tail -3 || echo "checkout 失败"
+          echo "已替换 module.h/moduleparam.h 为 6.6.118 版（struct module 布局对齐设备）"
 
       - name: Get KernelSU version # 获取 KernelSU 版本
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
