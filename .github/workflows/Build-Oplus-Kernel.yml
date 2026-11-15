@@ -243,11 +243,8 @@ jobs:
           echo "确认 KABI 配置："
           grep 'ANDROID_KABI_RESERVE' .config || echo "KABI 缺失！"
           echo "patch module.h：btf_data 字段无条件（对齐 struct module 布局）..."
-          python3 -c "
-s=open('include/linux/module.h').read()
-s=s.replace('#ifdef CONFIG_DEBUG_INFO_BTF_MODULES\n\tunsigned int btf_data_size;\n\tvoid *btf_data;\n#endif\n','\tunsigned int btf_data_size;\n\tvoid *btf_data;\n')
-open('include/linux/module.h','w').write(s)
-"
+          sed -i '/#ifdef CONFIG_DEBUG_INFO_BTF_MODULES/,/#endif/ { /#ifdef CONFIG_DEBUG_INFO_BTF_MODULES/d; /#endif/d; }' include/linux/module.h
+          grep -c 'btf_data_size' include/linux/module.h
           echo "禁用 UBSAN_BOUNDS_STRICT 和 BTF_MODULES（避免 clang 编译错误）..."
           scripts/config --disable UBSAN_BOUNDS_STRICT --disable UBSAN --disable DEBUG_INFO_BTF --disable DEBUG_INFO_BTF_MODULES 2>/dev/null || true
           make ARCH=arm64 LLVM=1 olddefconfig 2>&1 | tail -1
