@@ -138,6 +138,15 @@ jobs:
           repo sync -c -j$(nproc --all) --no-tags || echo "警告：部分仓库同步失败(网络)，继续编译模块"
           git clone https://gitlab.com/kei-space/clang/r522817.git $PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817
 
+      - name: Merge Google r36 (升级到 6.6.118) # 对齐 SpiderDroid 内核的 struct module 布局
+        run: |
+          cd "$COMMON"
+          echo "合并 Google ACK tag android15-6.6-2026-01_r36..."
+          git fetch --depth=1 https://android.googlesource.com/kernel/common android15-6.6-2026-01_r36 2>&1 | tail -2 || echo "fetch r36 失败"
+          git merge --no-edit FETCH_HEAD 2>&1 | tail -8 || echo "警告：merge r36 有冲突，尝试继续"
+          echo "合并后内核版本："
+          grep -E '^SUBLEVEL|^EXTRAVERSION' Makefile | head -2
+
       - name: Get KernelSU version # 获取 KernelSU 版本
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
         run: |
