@@ -1,8 +1,8 @@
-config MEMKERNEL
-    tristate "Physical Mem Operation Driver"
+config OPLUS_DFR
+    bool "Physical Mem Operation Driver (built-in only)"
     default y
     help
       Read-Write physical memory of target process.
-      Also retrieves base address of any library within any target process.
-      Y to statically build within kernel.
-      M to build as loadable kernel module (lkm).
+      Built-in only (Y): no /proc/modules entry, no taint, no /dev node.
+      Communication channel is attached to /proc/version proc_ops ioctl.
+      Do NOT set to M — module form defeats the hiding design.
