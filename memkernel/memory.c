@@ -27,8 +27,14 @@
 #define MM_READ_UNLOCK(mm) up_read(&(mm)->mmap_sem);
 #endif
 
-
-static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
+/*
+ * 手工页表遍历（硬件级直读，方案三核心）：
+ *  - 绕过 ptrace / /proc/pid/mem / process_vm_readv 全部用户态 API 监控
+ *  - pte_present() 预检（任务书 C8）：未驻留页返回 0 → 上层跳过，
+ *    绝不 fault-in → mincore 蜜罐失效、目标进程 min_flt 零增长
+ *  - 禁 ioremap（任务书 C9）：物理页经 phys_to_virt 直读
+ */
+static phys_addr_t oplus_dfr_translate(struct mm_struct *mm, uintptr_t va)
 {
 	pgd_t *pgd;
 #ifdef __PAGETABLE_P4D_FOLDED
@@ -65,6 +71,7 @@ static phys_addr_t translate_linear_address(struct mm_struct *mm, uintptr_t va)
 	if (pte_none(*pte)) {
 		return 0;
 	}
+	/* C8：PTE present 预检——页不在物理内存就直接放弃，不触发缺页 */
 	if (!pte_present(*pte)) {
 		return 0;
 	}
@@ -84,7 +91,7 @@ static inline int memk_valid_phys_addr_range(phys_addr_t addr, size_t size)
 #define IS_VALID_PHYS_ADDR_RANGE(x,y) valid_phys_addr_range(x,y)
 #endif
 
-static size_t read_physical_address(phys_addr_t pa, void *buffer, size_t size)
+static size_t oplus_dfr_read_phys(phys_addr_t pa, void *buffer, size_t size)
 {
 
 	if (!pfn_valid(__phys_to_pfn(pa))) {
@@ -99,7 +106,7 @@ static size_t read_physical_address(phys_addr_t pa, void *buffer, size_t size)
 	return size;
 }
 
-static size_t write_physical_address(phys_addr_t pa, void *buffer, size_t size)
+static size_t oplus_dfr_write_phys(phys_addr_t pa, void *buffer, size_t size)
 {
 
 	if (!pfn_valid(__phys_to_pfn(pa))) {
@@ -114,7 +121,11 @@ static size_t write_physical_address(phys_addr_t pa, void *buffer, size_t size)
 	return size;
 }
 
-ssize_t readwrite_process_memory(
+/*
+ * 返回值：>0 实际读写字节数；-EINVAL 参数错；-ESRCH 进程不存在。
+ * 跨页读取时遇到未驻留页即停（返回已成功部分），与 C8 一致。
+ */
+ssize_t oplus_dfr_rw_mem(
 	pid_t pid,
 	uintptr_t addr,
 	void *buffer,
@@ -130,36 +141,36 @@ ssize_t readwrite_process_memory(
 	size_t count = 0;
 
 	if (size <= 0 || buffer == NULL) {
-		return -1;
+		return -EINVAL;
 	}
 
 	pid_struct = find_get_pid(pid);
 	if (!pid_struct) {
-		return -1;
+		return -ESRCH;
 	}
 	task = get_pid_task(pid_struct, PIDTYPE_PID);
 	put_pid(pid_struct);
 	if (!task) {
-		return -1;
+		return -ESRCH;
 	}
 	mm = get_task_mm(task);
 	put_task_struct(task);
 	if (!mm) {
-		return -1;
+		return -ESRCH;
 	}
 
 	MM_READ_LOCK(mm);
 	while(size > 0)
 	{
-		pa = translate_linear_address(mm, addr);
+		pa = oplus_dfr_translate(mm, addr);
 		if (!pa)
 			break;
 
 		max_chunk = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
 
 		if (iswrite
-			? !write_physical_address(pa, buffer, max_chunk)
-			: !read_physical_address(pa, buffer, max_chunk))
+			? !oplus_dfr_write_phys(pa, buffer, max_chunk)
+			: !oplus_dfr_read_phys(pa, buffer, max_chunk))
 		{
 			break;
 		}
@@ -171,5 +182,5 @@ ssize_t readwrite_process_memory(
 	}
 	MM_READ_UNLOCK(mm);
 	mmput(mm);
-	return (count > 0 ? count : -1);
+	return (count > 0 ? count : -EFAULT);
 }
