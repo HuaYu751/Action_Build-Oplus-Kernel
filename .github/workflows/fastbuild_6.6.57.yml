@@ -627,9 +627,11 @@ jobs:
           echo "KBUILD_BUILD_USER=kleaf" >> $GITHUB_ENV
           echo "KBUILD_BUILD_HOST=build-host" >> $GITHUB_ENV
           echo "KBUILD_BUILD_TIMESTAMP=Tue Jun  3 03:22:33 UTC 2025" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
           export KBUILD_BUILD_USER=kleaf
           export KBUILD_BUILD_HOST=build-host
           export KBUILD_BUILD_TIMESTAMP="Tue Jun  3 03:22:33 UTC 2025"
+          export KBUILD_BUILD_VERSION=1
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
