@@ -10,13 +10,13 @@ OUT="${2:?usage: $0 <vmlinux> <output_header>}"
 [ -f "$VMLINUX" ] || { echo "【P5】vmlinux 不存在: $VMLINUX"; exit 1; }
 
 # 需隐藏的符号前缀（宽松正则，覆盖编译器 .constprop.0 等后缀变体）：
-#   nm_* / vfs_map_*        —— NoMount 引擎（P2 内置时存在）
+#   nm_* / nomount_*        —— NoMount 引擎（P2 内置时存在；钩子函数是 nomount_ 前缀）
 #   oplus_dfr_* / dispatch_* —— 我们的驱动（P3 内置时存在）
 #   readwrite_process*       —— 旧版驱动命名（防御性保留）
 # __kcfi_typeid_* 是 CFI 生成的类型 id，原厂也有大量此类符号，
 # 只过滤我们前缀命中的（正则已含前缀，天然只命中我们的）。
 nm "$VMLINUX" 2>/dev/null | awk '{print $3}' | \
-  grep -E '^(nm_|vfs_map_|oplus_dfr_|dispatch_|readwrite_process)' | \
+  grep -E '^(nm_|nomount_|vfs_map_|oplus_dfr_|dispatch_|readwrite_process)' | \
   sort -u > /tmp/hidden_syms.txt
 
 COUNT=$(wc -l < /tmp/hidden_syms.txt)
