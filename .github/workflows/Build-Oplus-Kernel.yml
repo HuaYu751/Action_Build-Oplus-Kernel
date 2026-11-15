@@ -229,23 +229,12 @@ jobs:
           echo "准备模块编译环境（modules_prepare）..."
           make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld gki_defconfig 2>&1 | tail -2
           make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld modules_prepare 2>&1 | tail -3
-          # 找符号表：优先从 oplus 构建产物找，找不到就编译 vmlinux 生成
-          SYMVER=$(find "$PLATFORM/out" -name "Module.symvers" -o -name "vmlinux.symvers" 2>/dev/null | head -1)
-          if [ -n "$SYMVER" ]; then
-            cp "$SYMVER" Module.symvers
-            echo "使用 oplus 构建产物符号表: $SYMVER"
-          else
-            echo "out 目录无符号表，编译 vmlinux 生成..."
-            make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld -j$(nproc) vmlinux 2>&1 | tail -3
-            cp vmlinux.symvers Module.symvers 2>/dev/null || echo "警告：符号表仍缺失"
-          fi
-          echo "编译 MemKernel 模块..."
+          echo "编译 MemKernel 模块（忽略符号缺失，CRC 本地再 patch）..."
           mkdir -p /tmp/memkernel && cd /tmp/memkernel
           for f in Kconfig Makefile comm.h entry.c memory.c memory.h; do
             curl -sSL "https://raw.githubusercontent.com/HuaYu751/Action_Build-Oplus-Kernel/master/memkernel/$f" -o "$f" || { echo "下载 $f 失败"; exit 1; }
           done
-          ls -la
-          make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld -C "$COMMON" M=$PWD modules 2>&1 | tail -6
+          make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld KBUILD_MODPOST_WARN=1 -C "$COMMON" M=$PWD modules 2>&1 | tail -8
           if [ ! -f memkernel.ko ]; then echo "模块编译失败"; exit 1; fi
           cp memkernel.ko "$WORKSPACE/image_output/memkernel.ko"
           echo "模块编译成功："
