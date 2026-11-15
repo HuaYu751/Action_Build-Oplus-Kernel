@@ -238,7 +238,7 @@ jobs:
           export PATH="$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817/bin:$PATH"
           cd "$COMMON"
           echo "用设备 config 配置（含 KABI，与 SpiderDroid 一致）..."
-          cp "$GITHUB_WORKSPACE/device_config.txt" .config 2>/dev/null || echo "无 device_config.txt，用 gki_defconfig"
+          curl -sSL "https://raw.githubusercontent.com/HuaYu751/Action_Build-Oplus-Kernel/master/device_config.txt" -o .config || echo "下载 device_config.txt 失败"
           make ARCH=arm64 LLVM=1 olddefconfig 2>&1 | tail -1
           echo "确认 KABI 配置："
           grep 'ANDROID_KABI_RESERVE' .config || echo "KABI 缺失！"
