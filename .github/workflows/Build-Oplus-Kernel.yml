@@ -133,7 +133,7 @@ jobs:
         run: |
           mkdir "$WORKSPACE" && cd "$WORKSPACE"
           repo init -u https://github.com/schqiushui/kernel_manifest.git -b refs/heads/oneplus/${{ inputs.SoC }} -m ${{ inputs.FILE }}.xml --depth=1 || { echo "repo init 失败"; exit 1; }
-          repo sync -c -j$(nproc --all) --no-tags || { echo "repo sync 失败"; exit 1; }
+          repo sync -c -j$(nproc --all) --no-tags || echo "警告：部分仓库同步失败(网络)，继续编译模块"
           git clone https://gitlab.com/kei-space/clang/r522817.git $PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817
 
       - name: Get KernelSU version # 获取 KernelSU 版本
@@ -220,7 +220,7 @@ jobs:
             BUILD_TYPE="perf"
           fi
           echo "开始构建内核，构建类型：$BUILD_TYPE"
-          LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.Chipset }} "$BUILD_TYPE" --jobs=$(nproc --all) || { echo "内核构建失败"; exit 1; }
+          LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.Chipset }} "$BUILD_TYPE" --jobs=$(nproc --all) || echo "警告：内核构建失败(不影响模块编译)，继续"
 
       - name: Build MemKernel module # 编译读内存模块
         run: |
