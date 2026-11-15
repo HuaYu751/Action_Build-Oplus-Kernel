@@ -1,3 +1,8 @@
+NoMount 6.6 集成补丁（Pad2Pro OKI + SUSFS 后适配版 v2）
+2026-11-16 重新生成：fs/Makefile / fs/statfs.c / fs/proc/task_mmu.c 三个 hunk
+按「OKI 源码 + 50_add_susfs + 69_hide_stuff」后的真实上下文重建，
+已用 git apply --check 严格验证（其余 5 文件沿用原版，云端已验证可应用）。
+
 diff --git a/fs/Kconfig b/fs/Kconfig
 index 2fb08d05d..70c64078d 100644
 --- a/fs/Kconfig
@@ -15,12 +20,11 @@ index 2fb08d05d..70c64078d 100644
 +
  endmenu
 diff --git a/fs/Makefile b/fs/Makefile
-index c6963a9a4..28f0b1854 100644
 --- a/fs/Makefile
 +++ b/fs/Makefile
-@@ -22,6 +22,8 @@ obj-y :=	open.o read_write.o file_table.o super.o \
- 		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
- 		kernel_read_file.o mnt_idmapping.o remap_range.o
+@@ -20,6 +20,8 @@
+ 
+ obj-$(CONFIG_KSU_SUSFS) += susfs.o
  
 +obj-$(CONFIG_NOMOUNT) += nomount.o
 +
@@ -123,10 +127,9 @@ index b31b583f1..ed75b39ad 100644
  	if (retval)
  		return retval;
 diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
-index 052e6d7bc..efda42908 100644
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
-@@ -389,6 +389,10 @@ static void show_vma_header_prefix(struct seq_file *m,
+@@ -263,6 +263,10 @@
  	seq_putc(m, ' ');
  }
  
@@ -134,19 +137,19 @@ index 052e6d7bc..efda42908 100644
 +extern bool nomount_spoof_mmap_metadata(struct inode *inode, dev_t *dev, unsigned long *ino);
 +#endif
 +
- static void
- show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
- {
-@@ -406,6 +410,9 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
- 		struct inode *inode = file_inode(vma->vm_file);
+ #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+ extern void susfs_sus_kstat_spoof_show_map_vma(struct inode *inode, dev_t *out_dev, unsigned long *out_ino);
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+@@ -353,6 +357,9 @@
+ #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
  		dev = inode->i_sb->s_dev;
  		ino = inode->i_ino;
 +#ifdef CONFIG_NOMOUNT
 +		nomount_spoof_mmap_metadata(inode, &dev, &ino);
 +#endif
  		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
- 	}
- 
+ #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+ 		susfs_sus_kstat_spoof_show_map_vma(inode, &dev, &ino);
 diff --git a/fs/readdir.c b/fs/readdir.c
 index c8c46e294..53c690036 100644
 --- a/fs/readdir.c
@@ -201,21 +204,20 @@ index 517fa4ed8..9078b57a3 100644
  EXPORT_SYMBOL_NS(vfs_getattr, ANDROID_GKI_VFS_EXPORT_ONLY);
  
 diff --git a/fs/statfs.c b/fs/statfs.c
-index 2a37f9f3d..ba9f23b73 100644
 --- a/fs/statfs.c
 +++ b/fs/statfs.c
-@@ -11,6 +11,10 @@
- #include <linux/compat.h>
+@@ -15,6 +15,10 @@
+ 
  #include "internal.h"
  
 +#ifdef CONFIG_NOMOUNT
 +extern void nomount_spoof_statfs(const struct path *path, struct kstatfs *buf);
 +#endif
 +
- static int flags_by_mnt(int mnt_flags)
- {
- 	int flags = 0;
-@@ -90,6 +94,9 @@ int vfs_statfs(const struct path *path, struct kstatfs *buf)
+ #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+ extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
+ extern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);
+@@ -171,6 +175,9 @@
  	error = statfs_by_dentry(path->dentry, buf);
  	if (!error)
  		buf->f_flags = calculate_f_flags(path->mnt);
