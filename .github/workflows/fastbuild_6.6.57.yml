@@ -80,6 +80,11 @@ on:
         required: true
         type: boolean
         default: 'true'
+      oplus_dfr_enable:
+        description: '【P3】是否内置 memkernel 内存驱动(方案三: built-in + /proc/version ioctl 通道; P1 验证通过前保持关闭)'
+        required: true
+        type: boolean
+        default: 'false'
       ccache_update:
         description: '更新ccache缓存(将本次编译生成的ccache缓存覆盖至仓库缓存，在更改编译配置、源码或需要刷新缓存时开启)'
         required: true
@@ -536,6 +541,32 @@ jobs:
           cd ./common
           curl -sSL https://github.com/cctv18/Baseband-guard/raw/master/setup.sh | bash
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+
+      - name: 【P3】内置 memkernel 驱动（方案三）
+        if: inputs.oplus_dfr_enable
+        run: |
+          cd kernel_workspace/common
+          echo "【P3】集成 memkernel built-in 驱动..."
+          # 1. 驱动源码放入 drivers/oplus_dfr（不含 patches/INTEGRATE 等辅助文件）
+          mkdir -p drivers/oplus_dfr
+          cp ../$GITHUB_ACTOR/memkernel/Kconfig ../$GITHUB_ACTOR/memkernel/Makefile \
+             ../$GITHUB_ACTOR/memkernel/comm.h ../$GITHUB_ACTOR/memkernel/memory.h \
+             ../$GITHUB_ACTOR/memkernel/memory.c ../$GITHUB_ACTOR/memkernel/entry.c \
+             drivers/oplus_dfr/
+          # 2. 挂进构建（幂等：已存在则不重复追加）
+          grep -q 'oplus_dfr' drivers/Makefile || \
+            echo 'obj-$(CONFIG_OPLUS_DFR) += oplus_dfr/' >> drivers/Makefile
+          grep -q 'oplus_dfr/Kconfig' drivers/Kconfig || \
+            echo 'source "drivers/oplus_dfr/Kconfig"' >> drivers/Kconfig
+          # 3. 打 /proc/version ioctl 通道补丁（C10）
+          git apply ../$GITHUB_ACTOR/memkernel/patches/0001-proc-version-ioctl.patch || \
+            { echo "【P3】通道补丁应用失败（上下文偏移需人工对齐）"; exit 1; }
+          # 4. defconfig 开启（Kconfig 已 default y，显式写出以便审计）
+          echo "CONFIG_OPLUS_DFR=y" >> arch/arm64/configs/gki_defconfig
+          # 5. 静态校验：version.c 必须含我们的入口，defconfig 必须含配置
+          grep -q 'oplus_dfr_dispatch' fs/proc/version.c || { echo "【P3】version.c 未挂上通道"; exit 1; }
+          grep -q 'CONFIG_OPLUS_DFR' arch/arm64/configs/gki_defconfig || { echo "【P3】defconfig 未生效"; exit 1; }
+          echo "【P3】memkernel 集成完成：built-in / 无 misc / /proc/version 通道"
 
       - name: 添加制作名称
         run: |
