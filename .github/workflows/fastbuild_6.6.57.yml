@@ -90,6 +90,11 @@ on:
         required: true
         type: boolean
         default: 'false'
+      kallsyms_filter_enable:
+        description: '【P5】是否过滤 /proc/kallsyms 中我们的符号(P2/P3 内置后开启; 会增量重编 Image, 耗时翻倍)'
+        required: true
+        type: boolean
+        default: 'false'
       ccache_update:
         description: '更新ccache缓存(将本次编译生成的ccache缓存覆盖至仓库缓存，在更改编译配置、源码或需要刷新缓存时开启)'
         required: true
@@ -713,6 +718,37 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
+
+      - name: 【P5】kallsyms 符号过滤（9-B 方案）
+        if: inputs.kallsyms_filter_enable
+        run: |
+          cd kernel_workspace
+          # 确保自仓库已克隆
+          if [ ! -d "$GITHUB_ACTOR" ]; then
+            git clone --depth=1 https://github.com/$GITHUB_REPOSITORY.git -b $GITHUB_REF_NAME $GITHUB_ACTOR
+          fi
+          cd common
+          echo "【P5】kallsyms 输出过滤：生成过滤表 → 打补丁 → 增量重编"
+          # B1: 从 vmlinux 生成 include/generated/hidden_syms.h
+          chmod +x ../$GITHUB_ACTOR/scripts/p5_gen_hidden_syms.sh
+          bash ../$GITHUB_ACTOR/scripts/p5_gen_hidden_syms.sh out/vmlinux include/generated/hidden_syms.h || {
+            rc=$?
+            if [ $rc -eq 2 ]; then
+              echo "【P5】过滤表为空（P2/P3 未开），无需过滤，跳过"
+              exit 0
+            fi
+            echo "【P5】生成过滤表失败"; exit 1;
+          }
+          # B2: 锚点插入过滤（幂等），目标文件是 kernel/kallsyms.c（6.6 树在此，不在 fs/proc/）
+          python3 ../$GITHUB_ACTOR/scripts/p5_patch_kallsyms.py kernel/kallsyms.c || { echo "【P5】kallsyms.c 打补丁失败"; exit 1; }
+          grep -q 'kallsyms_is_hidden' kernel/kallsyms.c || { echo "【P5】补丁未生效"; exit 1; }
+          # B3: 增量重编 Image（复用构建工具链与 ccache，分钟级）
+          WORKDIR="$(pwd)/.."
+          export PATH="$WORKDIR/clang18/bin:$WORKDIR/build-tools/bin:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image || { echo "【P5】增量重编失败"; exit 1; }
+          ls -lh out/arch/arm64/boot/Image
+          echo "【P5】完成：/proc/kallsyms 输出将跳过过滤表内全部符号"
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
