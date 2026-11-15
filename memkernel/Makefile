@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 # kbuild part of makefile
-	obj-m  := memkernel.o
-	memkernel-y := memory.o entry.o
+	obj-m  := oplus_bsp_dfr_state.o
+	oplus_bsp_dfr_state-y := memory.o entry.o
 else
 # normal makefile
 default:
