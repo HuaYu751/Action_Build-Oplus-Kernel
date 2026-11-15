@@ -241,6 +241,12 @@ jobs:
           echo "模块编译成功："
           ls -lh "$WORKSPACE/image_output/memkernel.ko"
 
+      - name: Upload memkernel.ko # 单独上传模块产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: memkernel-ko
+          path: ${{ env.WORKSPACE }}/image_output/memkernel.ko
+
       - name: Make AnyKernel3 # 制作 AnyKernel3
         run: |
           cd "$WORKSPACE"
