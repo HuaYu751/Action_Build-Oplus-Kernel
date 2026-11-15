@@ -1,28 +1,14 @@
-From: huyu
-Date: Sun, 16 Nov 2026
-Subject: [PATCH] fs/proc/version: attach oplus_dfr ioctl channel (CONFIG_OPLUS_DFR)
+fs/proc/version: attach oplus_dfr ioctl channel (CONFIG_OPLUS_DFR) — OKI 适配版 v2
+2026-11-16 重新生成：OKI 树 version.c 带 pde/pde_make_permanent，原版上下文不匹配。
+保留 pde_make_permanent（两分支通用），proc_ops 不再重复 PROC_ENTRY_PERMANENT。
+已用 git apply --check 严格验证。
 
-任务书 C10：/proc/version 原生无任何 ioctl 处理，对任意 cmd 返回 -ENOTTY。
-挂上 proc_ops.proc_ioctl 后，未命中幻数区间 / 未认证 / 非绑定进程的请求
-仍由 oplus_dfr_dispatch 返回 -ENOTTY，行为与原生节点完全一致。
-
-注意：本补丁按 6.6 GKI 的 fs/proc/version.c 原始上下文编写。
-不同内核树上下文行号可能有偏移，应用失败时按下方「手工对齐版」改：
-把 proc_create_single 换成 proc_create + 自定义 proc_ops 即可，
-关键三行：.proc_read = seq_read / .proc_lseek = seq_lseek /
-.proc_release = single_release（与 proc_create_single 内部实现一致）。
----
- fs/proc/version.c | 32 +++++++++++++++++++++++++++++++-
- 1 file changed, 31 insertions(+), 1 deletion(-)
-
-diff --git a/fs/proc/version.c b/fs/proc/version.c
-index 4a1a0d3..8b2f5e9 100644
 --- a/fs/proc/version.c
 +++ b/fs/proc/version.c
-@@ -13,10 +13,40 @@ static int version_proc_show(struct seq_file *m, void *v)
+@@ -16,11 +16,38 @@
  	return 0;
  }
-
+ 
 +#ifdef CONFIG_OPLUS_DFR
 +extern long oplus_dfr_dispatch(unsigned int cmd, unsigned long arg);
 +
@@ -38,7 +24,6 @@ index 4a1a0d3..8b2f5e9 100644
 +}
 +
 +static const struct proc_ops version_proc_ops = {
-+	.proc_flags	= PROC_ENTRY_PERMANENT,
 +	.proc_open	= version_proc_open,
 +	.proc_read	= seq_read,
 +	.proc_lseek	= seq_lseek,
@@ -49,13 +34,13 @@ index 4a1a0d3..8b2f5e9 100644
 +
  static int __init proc_version_init(void)
  {
+ 	struct proc_dir_entry *pde;
+ 
 +#ifdef CONFIG_OPLUS_DFR
-+	proc_create("version", 0, NULL, &version_proc_ops);
++	pde = proc_create("version", 0, NULL, &version_proc_ops);
 +#else
- 	proc_create_single("version", 0, NULL, version_proc_show);
+ 	pde = proc_create_single("version", 0, NULL, version_proc_show);
 +#endif
+ 	pde_make_permanent(pde);
  	return 0;
  }
- fs_initcall(proc_version_init);
---
-2.43.0
