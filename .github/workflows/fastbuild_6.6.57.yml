@@ -570,7 +570,7 @@ jobs:
           # 3. defconfig 显式开启（Kconfig 已 default y，显式写出以便审计）
           echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
           # 4. 静态校验
-          grep -q 'CONFIG_NOMOUNT' fs/Kconfig || { echo "【P2】fs/Kconfig 未生效"; exit 1; }
+          grep -q 'config NOMOUNT' fs/Kconfig || { echo "【P2】fs/Kconfig 未生效"; exit 1; }
           grep -q 'nomount.o' fs/Makefile || { echo "【P2】fs/Makefile 未生效"; exit 1; }
           grep -q 'nomount_handle_getname' fs/namei.c || { echo "【P2】namei 钩子未生效"; exit 1; }
           echo "【P2】NoMount 集成完成：8 文件钩子全部就位"
