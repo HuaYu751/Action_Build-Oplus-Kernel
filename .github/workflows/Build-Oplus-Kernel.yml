@@ -1,5 +1,4 @@
 name: Build Oplus Kernel # 构建一加内核
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,7 +6,6 @@ on:
         description: "芯片型号 // SoC to build"
         required: true
         default: 'sm8750'
-
       FILE:
         description: "配置文件名 // Configuration file name"
         required: true
@@ -17,22 +15,18 @@ on:
           - oneplus_13t_v
           - oneplus_ace5_pro_v
         default: oneplus_13_v
-
       Chipset:
         description: "开发板代号 // Chipset codename"
         required: true
         default: 'sun'
-
       VERSION:
         description: "版本格式 // Format: android15-6.6 [Android版本-内核版本]"
         required: true
         default: 'android15-6.6'
-
       KERNEL_NAME:
         description: "内核名称后缀 // Kernel name suffix"
         required: true
         default: '-android15-8-g013ec21bba94-abogki383916444'
-
       KSU_CONFIG:
         description: "选择 KernelSU 配置 // Select KernelSU configuration"
         required: true
@@ -42,7 +36,6 @@ on:
           - SukiSU_dev
           - SukiSU_stable
         default: SukiSU_dev
-
       SUSFS:
         description: "启用 SUSFS // Enable SUSFS"
         required: true
@@ -51,7 +44,6 @@ on:
           - enable
           - disable
         default: enable
-
       VFS:
         description: "启用 VFS 补丁（新的手动钩子） // Enable VFS patch (new hooks)"
         required: true
@@ -60,7 +52,6 @@ on:
           - enable
           - disable
         default: enable
-
       KPM:
         description: "启用 KPM 补丁 // Enable kernel patched modules"
         required: true
@@ -69,11 +60,13 @@ on:
           - enable
           - disable
         default: enable
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Parse VERSION input # 解析 VERSION 输入
         run: |
           VERSION=$(echo "${{ github.event.inputs.VERSION }}")
@@ -85,25 +78,16 @@ jobs:
       - name: Parse Device Name # 解析机型名称
         run: |
           FILE="${{ inputs.FILE }}"
-
-          # 移除末尾的 _v（如果有）
           BASE_NAME="${FILE%_u}"
           BASE_NAME="${BASE_NAME%_v}"
-
-          # 提取品牌（第一个下划线前的部分）
           RAW_BRAND="${BASE_NAME%%_*}"
-
-          # 提取型号（品牌后的所有部分）
           MODEL="${BASE_NAME#*_}"
-          MODEL="${MODEL//_/ }"  # 把下划线换成空格，比如 ace5_pro -> ace5 pro
-
-          # 品牌映射：首字母大写或自定义映射
+          MODEL="${MODEL//_/ }"
           case "$RAW_BRAND" in
             oneplus) BRAND="OnePlus" ;;
-            oppo)    BRAND="OPPO" ;;
-            *)       BRAND="$(echo "$RAW_BRAND" | sed 's/.*/\u&/')" ;;  # 默认只大写首字母
+            oppo) BRAND="OPPO" ;;
+            *) BRAND="$(echo "$RAW_BRAND" | sed 's/.*/\u&/')" ;;
           esac
-
           echo "BRAND=${BRAND}" >> $GITHUB_ENV
           echo "MODEL=${MODEL}" >> $GITHUB_ENV
           echo "Device 机型：${BRAND} ${MODEL}"
@@ -114,8 +98,6 @@ jobs:
           PLATFORM_DIR="$WORKSPACE_DIR/kernel_platform"
           COMMON_DIR="$PLATFORM_DIR/common"
           DEFCONFIG="$COMMON_DIR/arch/arm64/configs/gki_defconfig"
-
-          # Set working DIR as an environment variable for future steps
           echo "WORKSPACE=$WORKSPACE_DIR" >> $GITHUB_ENV
           echo "PLATFORM=$PLATFORM_DIR" >> $GITHUB_ENV
           echo "COMMON=$COMMON_DIR" >> $GITHUB_ENV
@@ -169,7 +151,6 @@ jobs:
         run: |
           cd "$PLATFORM"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s ${{ env.SukiSU_BRANCH }}
-
           cd ./KernelSU
           KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
@@ -183,27 +164,17 @@ jobs:
           cd "$WORKSPACE"
           git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-
-          # Copy patches
           cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch "$COMMON/"
           cp ./susfs4ksu/kernel_patches/fs/* "$COMMON/fs/"
           cp ./susfs4ksu/kernel_patches/include/linux/* "$COMMON/include/linux/"
           cp ./SukiSU_patch/69_hide_stuff.patch "$COMMON/"
-
-          # Patches apply
           cd "$COMMON"
           echo "正在给内核打 susfs 补丁..."
-
           if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t_v" ]]; then
-            sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace/hooks/fs.h>' ./fs/namespace.c
+            sed -i '/#include /a #include ' ./fs/namespace.c
           fi
-
           patch -p1 < "50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch" || { echo "应用 susfs 补丁失败"; exit 1; }
           echo "susfs 补丁应用完成"
-
-          #echo "正在打隐藏应用补丁..."
-          #patch -p1 -F 3 < "69_hide_stuff.patch" || { echo "应用隐藏应用补丁失败"; exit 1; }
-          #echo "隐藏应用补丁应用完成"
 
       - name: Apply New Hooks patches # 应用新的钩子补丁
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') && inputs.VFS == 'enable' }}
@@ -215,7 +186,6 @@ jobs:
             echo "SukiSU_patch 目录已存在，跳过克隆。"
           fi
           cp ./SukiSU_patch/hooks/syscall_hooks.patch "$COMMON/"
-
           cd "$COMMON"
           echo "正在打 vfs 补丁..."
           patch -p1 -F 3 < "syscall_hooks.patch" || { echo "应用 vfs 补丁失败"; exit 1; }
@@ -224,12 +194,8 @@ jobs:
       - name: Configure kernel # 配置内核
         run: |
           cd "$WORKSPACE"
-
-          # Remove protected exports and strings
           rm $PLATFORM/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
           rm $PLATFORM/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
-
-          # Adjust localversion strings
           sed -i 's/check_defconfig//' "$PLATFORM/common/build.config.gki"
           sed -i 's/ -dirty//g' "$PLATFORM/common/scripts/setlocalversion"
           sed -i 's/ -dirty//g' "$PLATFORM/msm-kernel/scripts/setlocalversion"
@@ -237,38 +203,11 @@ jobs:
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl"
           sed -i '/KMI_GENERATION/s/-$oki_infix//g' "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl"
           sed -i 's/^\(CONFIG_LOCALVERSION="[^"]*\)"/\1-Lotus"/' "$DEFCONFIG"
-
-          # Replace kernel name strings
-          #echo "正在设置内核名称..."
-          #sed -i '$s|echo "\$res"|echo "\${{ inputs.KERNEL_NAME }}"|' "$COMMON/scripts/setlocalversion"
-          #echo "内核名称设置完成"
-
-          # Set KSU config to gki_defconfig
-          echo "正在更新KernelSU 内核配置..."
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
           echo "CONFIG_KPM=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SUS_SU=${{ inputs.VFS == 'enable' && 'n' || 'y' }}" >> "$DEFCONFIG"
           echo "CONFIG_KSU_MANUAL_HOOK=${{ inputs.VFS == 'enable' && 'y' || 'n' }}" >> "$DEFCONFIG"
-
-          # Use SukiSU default config
-          #echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
-          #echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
           echo "更新KernelSU 内核配置完成"
-
-          # 
           cd "$COMMON"
           git status
           cat "$DEFCONFIG"
@@ -276,24 +215,36 @@ jobs:
       - name: Build kernel # 构建内核
         run: |
           cd "$WORKSPACE"
-
           BUILD_TYPE="gki"
           if [ "${{ inputs.Chipset }}" == "sun" ]; then
             BUILD_TYPE="perf"
           fi
-
           echo "开始构建内核，构建类型：$BUILD_TYPE"
           LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.Chipset }} "$BUILD_TYPE" --jobs=$(nproc --all) || { echo "内核构建失败"; exit 1; }
+
+      - name: Build MemKernel module # 编译读内存模块
+        run: |
+          export PATH="$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817/bin:$PATH"
+          cd "$COMMON"
+          echo "准备模块编译环境（modules_prepare）..."
+          make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld gki_defconfig 2>&1 | tail -2
+          make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld modules_prepare 2>&1 | tail -3
+          if [ ! -f Module.symvers ]; then
+            cp vmlinux.symvers Module.symvers 2>/dev/null || echo "警告：Module.symvers 未生成，尝试继续"
+          fi
+          echo "编译 MemKernel 模块..."
+          cd "$WORKSPACE/memkernel"
+          make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld -C "$COMMON" M=$PWD modules 2>&1 | tail -6
+          if [ ! -f memkernel.ko ]; then echo "模块编译失败"; exit 1; fi
+          cp memkernel.ko "$WORKSPACE/image_output/memkernel.ko"
+          echo "模块编译成功："
+          ls -lh "$WORKSPACE/image_output/memkernel.ko"
 
       - name: Make AnyKernel3 # 制作 AnyKernel3
         run: |
           cd "$WORKSPACE"
           mkdir -p image_output
-
-          # Clone AnyKernel3
           git clone https://github.com/schqiushui/AnyKernel3-KernelSU-Next.git -b gki-2.0 --depth=1 && rm -rf ./AnyKernel3-KernelSU-Next/.git
-
-          # Copy kernel
           IMAGE_PATH=$(find "$PLATFORM/out" -name "Image")
           if [ -n "$IMAGE_PATH" ]; then
             cp "$IMAGE_PATH" "$WORKSPACE/AnyKernel3-KernelSU-Next/Image"
@@ -303,25 +254,17 @@ jobs:
             echo "Image 文件未找到"
             exit 1
           fi
-
-          # Copy dtbo.img
           if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t_v" ]]; then
             readarray -d '' DTBO_FILES < <(find device/ -type f -name '*dtbo.img' -print0)
-
             if [ ${#DTBO_FILES[@]} -gt 0 ]; then
-                cp "${DTBO_FILES[@]}" "$WORKSPACE/image_output/"
-                echo "已复制以下文件到 image_output/："
-                printf "%s\n" "${DTBO_FILES[@]}"
-            else
-                echo "未找到任何 dtbo.img 文件"
+              cp "${DTBO_FILES[@]}" "$WORKSPACE/image_output/"
+              echo "已复制 dtbo.img"
             fi
           fi
-
-          # Copy boot.img
           BOOTIMG_PATH=$(find "$PLATFORM/out" -name "boot.img")
           if [ -n "$BOOTIMG_PATH" ]; then
             cp "$BOOTIMG_PATH" "$WORKSPACE/image_output/boot.img"
-            echo "boot.img 文件已找到:$BOOTIMG_PATH"
+            echo "boot.img 文件已找到"
           else
             echo "boot.img 文件未找到，已跳过复制"
           fi
@@ -333,7 +276,6 @@ jobs:
           curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
           chmod +x patch_linux
           ./patch_linux || { echo "应用 patch_linux 失败"; exit 1; }
-
           cp oImage "$WORKSPACE/AnyKernel3-KernelSU-Next/Image"
           echo "Patched Image 文件替换成功"
 
@@ -382,4 +324,3 @@ jobs:
             ${{ env.WORKSPACE }}/image_output/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
