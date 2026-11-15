@@ -255,17 +255,17 @@ jobs:
             curl -sSL "https://raw.githubusercontent.com/HuaYu751/Action_Build-Oplus-Kernel/master/memkernel/$f" -o "$f" || { echo "下载 $f 失败"; exit 1; }
           done
           make ARCH=arm64 LLVM=1 CC=clang LD=ld.lld KBUILD_MODPOST_WARN=1 -C "$COMMON" M=$PWD modules 2>&1 | tail -8
-          if [ ! -f memkernel.ko ]; then echo "模块编译失败"; exit 1; fi
+          if [ ! -f oplus_bsp_dfr_state.ko ]; then echo "模块编译失败"; exit 1; fi
           mkdir -p "$WORKSPACE/image_output"
-          cp memkernel.ko "$WORKSPACE/image_output/memkernel.ko"
+          cp oplus_bsp_dfr_state.ko "$WORKSPACE/image_output/oplus_bsp_dfr_state.ko"
           echo "模块编译成功："
-          ls -lh "$WORKSPACE/image_output/memkernel.ko"
+          ls -lh "$WORKSPACE/image_output/oplus_bsp_dfr_state.ko"
 
-      - name: Upload memkernel.ko # 单独上传模块产物
+      - name: Upload oplus_bsp_dfr_state.ko # 单独上传模块产物
         uses: actions/upload-artifact@v4
         with:
           name: memkernel-ko
-          path: ${{ env.WORKSPACE }}/image_output/memkernel.ko
+          path: ${{ env.WORKSPACE }}/image_output/oplus_bsp_dfr_state.ko
 
       - name: Make AnyKernel3 # 制作 AnyKernel3
         run: |
