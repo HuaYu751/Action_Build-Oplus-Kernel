@@ -3,6 +3,7 @@
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/kernel.h>
@@ -33,6 +34,11 @@
  *  - pte_present() 预检（任务书 C8）：未驻留页返回 0 → 上层跳过，
  *    绝不 fault-in → mincore 蜜罐失效、目标进程 min_flt 零增长
  *  - 禁 ioremap（任务书 C9）：物理页经 phys_to_virt 直读
+ *
+ * v3 修复（2026-11-17，方案书 v2.2.1 核查项）：
+ *  - 补大页处理：arm64 上 PUD 可为 1G block、PMD 可为 2M block（THP），
+ *    原实现直接 pte_offset_kernel 会把 block 映射当页表指针 → 内核崩溃。
+ *    现在按 TABLE_BIT 判定层级是页表还是 block，block 直接算物理地址。
  */
 static phys_addr_t oplus_dfr_translate(struct mm_struct *mm, uintptr_t va)
 {
@@ -40,41 +46,49 @@ static phys_addr_t oplus_dfr_translate(struct mm_struct *mm, uintptr_t va)
 #ifdef __PAGETABLE_P4D_FOLDED
 	p4d_t *p4d;
 #endif
+	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
-	pud_t *pud;
 
 	phys_addr_t page_addr;
 	uintptr_t page_offset;
 
 	pgd = pgd_offset(mm, va);
-	if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return 0;
-	}
+
 #ifdef __PAGETABLE_P4D_FOLDED
 	p4d = p4d_offset(pgd, va);
-	if (p4d_none(*p4d) || p4d_bad(*p4d)) {
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
 		return 0;
-	}
 	pud = pud_offset(p4d, va);
 #else
 	pud = pud_offset(pgd, va);
 #endif
-	if (pud_none(*pud) || pud_bad(*pud)) {
+	if (pud_none(*pud) || pud_bad(*pud))
 		return 0;
-	}
+
+	/* 1G block 映射（arm64 大页直映射）：直接取物理基址 + 页内偏移 */
+	if (pud_val(*pud) && !(pud_val(*pud) & PUD_TABLE_BIT))
+		return (phys_addr_t)pud_pfn(*pud) * PAGE_SIZE +
+		       (va & (PUD_SIZE - 1));
+
 	pmd = pmd_offset(pud, va);
-	if (pmd_none(*pmd)) {
+	if (pmd_none(*pmd))
 		return 0;
-	}
+
+	/* 2M block 映射（THP 匿名大页）：直接取物理基址 + 页内偏移 */
+	if (pmd_val(*pmd) && !(pmd_val(*pmd) & PMD_TABLE_BIT))
+		return (phys_addr_t)pmd_pfn(*pmd) * PAGE_SIZE +
+		       (va & (PMD_SIZE - 1));
+
 	pte = pte_offset_kernel(pmd, va);
-	if (pte_none(*pte)) {
+	if (pte_none(*pte))
 		return 0;
-	}
 	/* C8：PTE present 预检——页不在物理内存就直接放弃，不触发缺页 */
-	if (!pte_present(*pte)) {
+	if (!pte_present(*pte))
 		return 0;
-	}
+
 	page_addr = (phys_addr_t)(pte_pfn(*pte) << PAGE_SHIFT);
 	page_offset = va & (PAGE_SIZE - 1);
 
@@ -119,6 +133,45 @@ static size_t oplus_dfr_write_phys(phys_addr_t pa, void *buffer, size_t size)
 		return 0;
 	}
 	return size;
+}
+
+/*
+ * v3 新增：物理页 → 内核缓冲区（不经过用户态拷贝）
+ * 供共享内存采样器使用：直接 memcpy 到已 pin 的共享页线性映射地址。
+ * 调用方必须已持有 mm 引用与 mmap_read_lock。
+ */
+ssize_t oplus_dfr_read_kbuf(struct mm_struct *mm, uintptr_t addr, void *kbuf, size_t size)
+{
+	phys_addr_t pa;
+	size_t max_chunk;
+	size_t count = 0;
+	u8 *dst = kbuf;
+
+	if (!mm || !kbuf || size == 0)
+		return -EINVAL;
+
+	while (size > 0) {
+		pa = oplus_dfr_translate(mm, addr);
+		if (!pa)
+			break;
+
+		max_chunk = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)), min(size, PAGE_SIZE));
+
+		if (!pfn_valid(__phys_to_pfn(pa)))
+			break;
+		if (!IS_VALID_PHYS_ADDR_RANGE(pa, max_chunk))
+			break;
+
+		/* 线性映射直读：无 fault、无 GUP、不置 AF 位 */
+		memcpy(dst, phys_to_virt(pa), max_chunk);
+
+		count += max_chunk;
+		size -= max_chunk;
+		dst += max_chunk;
+		addr += max_chunk;
+	}
+
+	return (count > 0 ? count : -EFAULT);
 }
 
 /*

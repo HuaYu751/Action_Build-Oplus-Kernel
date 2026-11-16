@@ -3,7 +3,7 @@
 # 在 drivers/Makefile 加 obj-$(CONFIG_OPLUS_DFR) += oplus_dfr/，
 # 在 drivers/Kconfig 加 source "drivers/oplus_dfr/Kconfig"。
 obj-$(CONFIG_OPLUS_DFR) += memkernel.o
-memkernel-y := memory.o entry.o
+memkernel-y := memory.o entry.o shm.o
 
 # —— 以下为调试期备用：外部 LKM 编译（会破坏隐蔽性，仅调试用） ——
 # make -C $(KDIR) M=$(PWD) KDIR=<内核源码树> modules

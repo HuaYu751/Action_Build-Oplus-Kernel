@@ -11,7 +11,9 @@ OUT="${2:?usage: $0 <vmlinux> <output_header>}"
 
 # 需隐藏的符号前缀（宽松正则，覆盖编译器 .constprop.0 等后缀变体）：
 #   nm_* / nomount_*        —— NoMount 引擎（P2 内置时存在；钩子函数是 nomount_ 前缀）
-#   oplus_dfr_* / dispatch_* —— 我们的驱动（P3 内置时存在）
+#   oplus_dfr_* / dispatch_* —— 我们的驱动（P3 内置时存在；v2.2.2 起 shm 合并体的
+#                              全部内部符号已统一改名为 oplus_dfr_shm_* 前缀，
+#                              含静态函数与全局变量，由本项天然覆盖，无需新增正则）
 #   readwrite_process*       —— 旧版驱动命名（防御性保留）
 # __kcfi_typeid_* 是 CFI 生成的类型 id，原厂也有大量此类符号，
 # 只过滤我们前缀命中的（正则已含前缀，天然只命中我们的）。
