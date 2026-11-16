@@ -81,20 +81,20 @@ on:
         type: boolean
         default: 'true'
       oplus_dfr_enable:
-        description: '【P3】是否内置 memkernel 内存驱动(方案三: built-in + /proc/version ioctl 通道; P1 验证通过前保持关闭)'
+        description: '【P3】是否内置 memkernel 内存驱动(方案三: built-in + /proc/version ioctl 通道 + shm 共享内存合并体; v2.2.2 起默认开启)'
         required: true
         type: boolean
-        default: 'false'
+        default: 'true'
       nomount_enable:
-        description: '【P2】是否内置 NoMount 引擎(CONFIG_NOMOUNT=y; 装 meta-nomount 用户态模块时开启, 与 hybrid_mount 互斥)'
+        description: '【P2】是否内置 NoMount 引擎(CONFIG_NOMOUNT=y; 装 meta-nomount 用户态模块时开启, 与 hybrid_mount 互斥; v2.2.2 起默认开启并编译期关闭调试日志)'
         required: true
         type: boolean
-        default: 'false'
+        default: 'true'
       kallsyms_filter_enable:
-        description: '【P5】是否过滤 /proc/kallsyms 中我们的符号(P2/P3 内置后开启; 会增量重编 Image, 耗时翻倍)'
+        description: '【P5】是否过滤 /proc/kallsyms 中我们的符号(P2/P3 内置后必须开启; 会增量重编 Image, 耗时翻倍)'
         required: true
         type: boolean
-        default: 'false'
+        default: 'true'
       ccache_update:
         description: '更新ccache缓存(将本次编译生成的ccache缓存覆盖至仓库缓存，在更改编译配置、源码或需要刷新缓存时开启)'
         required: true
@@ -564,6 +564,9 @@ jobs:
           echo "【P2】集成 NoMount 引擎（CONFIG_NOMOUNT=y）..."
           # 1. 引擎源码放入 fs/
           cp ../$GITHUB_ACTOR/nomount_kernel/nomount.c ../$GITHUB_ACTOR/nomount_kernel/nomount.h fs/
+          # 1.1 编译期关闭 NoMount 调试日志（nm_debug 为写死 printk，无运行时开关；v2.2 已批准关闭）
+          sed -i 's|#define nm_debug(fmt, ...) printk.*|#define nm_debug(fmt, ...) do {} while (0)|' fs/nomount.c
+          grep -q '#define nm_debug(fmt, ...) do {} while (0)' fs/nomount.c || { echo "【P2】nm_debug 关闭失败"; exit 1; }
           # 2. 打集成补丁（fs/Kconfig + fs/Makefile + namei/d_path/readdir/stat/task_mmu/statfs 钩子）
           git apply ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch || \
             { echo "【P2】NoMount 补丁应用失败（上下文偏移需人工对齐）"; exit 1; }
@@ -586,10 +589,12 @@ jobs:
           cd common
           echo "【P3】集成 memkernel built-in 驱动..."
           # 1. 驱动源码放入 drivers/oplus_dfr（不含 patches/INTEGRATE 等辅助文件）
+          #    v2.2.2：shm.c/shm.h 为共享内存采样合并体，必须一并入树
           mkdir -p drivers/oplus_dfr
           cp ../$GITHUB_ACTOR/memkernel/Kconfig ../$GITHUB_ACTOR/memkernel/Makefile \
              ../$GITHUB_ACTOR/memkernel/comm.h ../$GITHUB_ACTOR/memkernel/memory.h \
              ../$GITHUB_ACTOR/memkernel/memory.c ../$GITHUB_ACTOR/memkernel/entry.c \
+             ../$GITHUB_ACTOR/memkernel/shm.h ../$GITHUB_ACTOR/memkernel/shm.c \
              drivers/oplus_dfr/
           # 2. 挂进构建（幂等：已存在则不重复追加）
           grep -q 'oplus_dfr' drivers/Makefile || \
@@ -601,10 +606,11 @@ jobs:
             { echo "【P3】通道补丁应用失败（上下文偏移需人工对齐）"; exit 1; }
           # 4. defconfig 开启（Kconfig 已 default y，显式写出以便审计）
           echo "CONFIG_OPLUS_DFR=y" >> arch/arm64/configs/gki_defconfig
-          # 5. 静态校验：version.c 必须含我们的入口，defconfig 必须含配置
+          # 5. 静态校验：version.c 必须含我们的入口，defconfig 必须含配置，Makefile 必须链入 shm.o
           grep -q 'oplus_dfr_dispatch' fs/proc/version.c || { echo "【P3】version.c 未挂上通道"; exit 1; }
           grep -q 'CONFIG_OPLUS_DFR' arch/arm64/configs/gki_defconfig || { echo "【P3】defconfig 未生效"; exit 1; }
-          echo "【P3】memkernel 集成完成：built-in / 无 misc / /proc/version 通道"
+          grep -q 'shm.o' drivers/oplus_dfr/Makefile || { echo "【P3】Makefile 未链入 shm.o"; exit 1; }
+          echo "【P3】memkernel 集成完成：built-in / 无 misc / /proc/version 通道 / shm 采样合并体"
 
       - name: 添加制作名称
         run: |
