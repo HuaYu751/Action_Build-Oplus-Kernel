@@ -597,13 +597,16 @@ jobs:
           # 3. 【改名】patch 应用后再对源码+内核文件做 sed 改名
           sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/nomount.c fs/nomount.h
           sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/nomount.c fs/nomount.h
+          sed -i 's/\bNM_/OPLUS_BSP_DFR_TASK_/g' fs/nomount.c fs/nomount.h
           sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' fs/nomount.c fs/nomount.h
-          sed -i 's/"nomount"/"oplus_bsp_dfr_task_nl"/g' fs/nomount.c
+          sed -i 's/"nomount"/"oplus_bsp_dfr_task_nl"/g' fs/nomount.c fs/nomount.h
           # 同步改 patch 写入到内核文件的 nomount 引用
           sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c fs/Kconfig fs/Makefile 2>/dev/null || true
           sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c 2>/dev/null || true
           sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' fs/Kconfig fs/Makefile 2>/dev/null || true
           sed -i 's/CONFIG_NOMOUNT/CONFIG_OPLUS_BSP_DFR_TASK_CTL/g' fs/Kconfig fs/Makefile arch/arm64/configs/gki_defconfig 2>/dev/null || true
+          # Kconfig 符号定义行单独改名（config NOMOUNT 不匹配上面任何规则，Run#10 P2 失败根因）
+          sed -i 's/^config NOMOUNT$/config OPLUS_BSP_DFR_TASK_CTL/' fs/Kconfig
           # 4. defconfig
           echo "CONFIG_OPLUS_BSP_DFR_TASK_CTL=y" >> arch/arm64/configs/gki_defconfig
           # 5. 静态校验（用新名字）
@@ -712,7 +715,7 @@ jobs:
           # 通用函数名改名
           for fn in hooks_install hooks_remove netlink_init netlink_exit \
                     policy_apply policy_free policy_init policy_lookup_as; do
-            newfn=$(echo "$fn" | sed 's/^/oplus_bsp_sched_/')
+            newfn=$(echo "$fn" | sed 's/^/oplus_bsp_dfr_sched_guard_/')
             sed -i "s/\b${fn}\b/${newfn}/g" drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
           done
           # F2 修复：kmi_compat.h 保持原名（不含 uidfake/kaux）；但 include guard UIDFAKE_KMI_COMPAT_H 已被上面 sed 改掉
