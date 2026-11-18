@@ -324,22 +324,23 @@ jobs:
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             cd ./common
-            # 【改名】susfs 源码：susfs_→oplus_bsp_dfr_map_ctl_，sus_→oplus_bsp_dfr_map_（不改 CONFIG_KSU_SUSFS）
+            # 原样应用 patch（不在 patch 文件上做 sed，避免上下文不匹配）
+            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+            # 【改名】patch 应用后再对源码做 sed 改名（susfs + hide_stuff）
             sed -i 's/susfs_/oplus_bsp_dfr_map_ctl_/g' fs/susfs.c include/linux/susfs.h 2>/dev/null || true
             sed -i 's/\bsus_path/oplus_bsp_dfr_map_path/g' fs/susfs.c include/linux/susfs.h 2>/dev/null || true
             sed -i 's/\bsus_mount/oplus_bsp_dfr_map_mount/g' fs/susfs.c include/linux/susfs.h 2>/dev/null || true
             sed -i 's/\bsus_kstat/oplus_bsp_dfr_map_kstat/g' fs/susfs.c include/linux/susfs.h 2>/dev/null || true
             sed -i 's/\bsus_map/oplus_bsp_dfr_map_map/g' fs/susfs.c include/linux/susfs.h 2>/dev/null || true
-            # 【改名】susfs patch 文件同步改名（patch 引用函数名必须和源码一致）
-            sed -i 's/susfs_/oplus_bsp_dfr_map_ctl_/g' 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch 2>/dev/null || true
-            sed -i 's/\bsus_path/oplus_bsp_dfr_map_path/g' 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch 2>/dev/null || true
-            sed -i 's/\bsus_mount/oplus_bsp_dfr_map_mount/g' 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch 2>/dev/null || true
-            sed -i 's/\bsus_kstat/oplus_bsp_dfr_map_kstat/g' 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch 2>/dev/null || true
-            sed -i 's/\bsus_map/oplus_bsp_dfr_map_map/g' 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch 2>/dev/null || true
-            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-            # 【改名】hide_stuff patch：show_vma_header_prefix_fake → oplus_bsp_dfr_kstat_show_vma
-            sed -i 's/show_vma_header_prefix_fake/oplus_bsp_dfr_kstat_show_vma/g' 69_hide_stuff.patch 2>/dev/null || true
-            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+            # 同步改 patch 写入到内核文件的 susfs 函数引用
+            sed -i 's/susfs_/oplus_bsp_dfr_map_ctl_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c fs/namespace.c fs/proc_namespace.c fs/read_write.c 2>/dev/null || true
+            sed -i 's/\bsus_path/oplus_bsp_dfr_map_path/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c 2>/dev/null || true
+            sed -i 's/\bsus_mount/oplus_bsp_dfr_map_mount/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c fs/namespace.c 2>/dev/null || true
+            sed -i 's/\bsus_kstat/oplus_bsp_dfr_map_kstat/g' fs/stat.c fs/statfs.c fs/proc/task_mmu.c 2>/dev/null || true
+            sed -i 's/\bsus_map/oplus_bsp_dfr_map_map/g' fs/proc/task_mmu.c 2>/dev/null || true
+            # hide_stuff 函数改名（patch 应用后改 task_mmu.c）
+            sed -i 's/show_vma_header_prefix_fake/oplus_bsp_dfr_kstat_show_vma/g' fs/proc/task_mmu.c 2>/dev/null || true
             cd ..
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
@@ -585,34 +586,30 @@ jobs:
           fi
           cd common
           echo "【P2】集成 NoMount 引擎（改名 oplus_bsp_dfr_task_ctl）..."
-          # 1. 引擎源码放入 fs/（保持文件名 nomount.c/.h 不改——集成 patch 引用文件名）
+          # 1. 引擎源码放入 fs/（保持文件名 nomount.c/.h 不改）
           cp ../$GITHUB_ACTOR/nomount_kernel/nomount.c ../$GITHUB_ACTOR/nomount_kernel/nomount.h fs/
           # 1.1 编译期关闭调试日志
           sed -i 's|#define nm_debug(fmt, ...) printk.*|#define nm_debug(fmt, ...) do {} while (0)|' fs/nomount.c
-          # 1.2 【改名】源码：nomount_→oplus_bsp_dfr_task_ctl_，nm_→oplus_bsp_dfr_task_，NOMOUNT_→OPLUS_BSP_DFR_TASK_CTL_
+          # 2. 原样打集成补丁（不在 patch 文件上做 sed，避免上下文不匹配）
+          git apply ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch || \
+            { echo "【P2】补丁应用失败（上下文偏移需人工对齐）"; exit 1; }
+          # 3. 【改名】patch 应用后再对源码+内核文件做 sed 改名
           sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/nomount.c fs/nomount.h
           sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/nomount.c fs/nomount.h
           sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' fs/nomount.c fs/nomount.h
-          # genl family "nomount" → "oplus_bsp_dfr_task_nl"
           sed -i 's/"nomount"/"oplus_bsp_dfr_task_nl"/g' fs/nomount.c
-          # 1.3 【改名】集成 patch 同步改名（patch 引用函数名/CONFIG/Makefile 目标必须和源码一致）
-          sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch
-          sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch
-          sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch
-          sed -i 's/config NOMOUNT/config OPLUS_BSP_DFR_TASK_CTL/g' ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch
-          sed -i 's/CONFIG_NOMOUNT/CONFIG_OPLUS_BSP_DFR_TASK_CTL/g' ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch
-          # 注意：nomount.o 不改——文件名保持 nomount.c，Makefile 目标也保持 nomount.o
-          # 注意：patch 里的文件路径（a/fs/nomount.c 等）不改——文件名保持 nomount.c
-          # 2. 打集成补丁
-          git apply ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch || \
-            { echo "【P2】补丁应用失败（上下文偏移需人工对齐）"; exit 1; }
-          # 3. defconfig
+          # 同步改 patch 写入到内核文件的 nomount 引用
+          sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c fs/Kconfig fs/Makefile 2>/dev/null || true
+          sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c 2>/dev/null || true
+          sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' fs/Kconfig fs/Makefile 2>/dev/null || true
+          sed -i 's/CONFIG_NOMOUNT/CONFIG_OPLUS_BSP_DFR_TASK_CTL/g' fs/Kconfig fs/Makefile arch/arm64/configs/gki_defconfig 2>/dev/null || true
+          # 4. defconfig
           echo "CONFIG_OPLUS_BSP_DFR_TASK_CTL=y" >> arch/arm64/configs/gki_defconfig
-          # 4. 静态校验（用新名字）
+          # 5. 静态校验（用新名字）
           grep -q 'config OPLUS_BSP_DFR_TASK_CTL' fs/Kconfig || { echo "【P2】fs/Kconfig 未生效"; exit 1; }
           grep -q 'nomount.o' fs/Makefile || { echo "【P2】fs/Makefile 未生效"; exit 1; }
           grep -q 'oplus_bsp_dfr_task_ctl_handle_getname' fs/namei.c || { echo "【P2】namei 钩子未生效"; exit 1; }
-          echo "【P2】NoMount 集成完成：改名 oplus_bsp_dfr_task_ctl / 8 文件钩子就位 / genl 改名"
+          echo "【P2】NoMount 集成完成：改名 oplus_bsp_dfr_task_ctl / patch 原样应用后改源码 / genl 改名"
 
       - name: 【P3-A】内置 VFS 控制模块
         if: inputs.pathmask_builtin_enable
