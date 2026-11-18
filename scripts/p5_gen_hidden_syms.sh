@@ -18,7 +18,7 @@ OUT="${2:?usage: $0 <vmlinux> <output_header>}"
 # __kcfi_typeid_* 是 CFI 生成的类型 id，原厂也有大量此类符号，
 # 只过滤我们前缀命中的（正则已含前缀，天然只命中我们的）。
 nm "$VMLINUX" 2>/dev/null | awk '{print $3}' | \
-  grep -E '^(nm_|nomount_|vfs_map_|oplus_dfr_|dispatch_|readwrite_process)' | \
+  grep -E '^(nm_|nomount_|vfs_map_|oplus_dfr_|oplus_bsp_dfr_inode_ctl_|oplus_bsp_dfr_symres_|oplus_bsp_dfr_sched_guard_|oplus_bsp_dfr_sched_|oplus_bsp_dfr_nl_|oplus_bsp_dfr_task_ctl_|oplus_bsp_dfr_map_ctl_|oplus_bsp_dfr_kstat_|dispatch_|readwrite_process)' | \
   sort -u > /tmp/hidden_syms.txt
 
 COUNT=$(wc -l < /tmp/hidden_syms.txt)
