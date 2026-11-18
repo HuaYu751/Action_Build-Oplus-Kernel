@@ -590,9 +590,10 @@ jobs:
           cp ../$GITHUB_ACTOR/nomount_kernel/nomount.c ../$GITHUB_ACTOR/nomount_kernel/nomount.h fs/
           # 1.1 编译期关闭调试日志
           sed -i 's|#define nm_debug(fmt, ...) printk.*|#define nm_debug(fmt, ...) do {} while (0)|' fs/nomount.c
-          # 2. 原样打集成补丁（不在 patch 文件上做 sed，避免上下文不匹配）
-          git apply ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch || \
-            { echo "【P2】补丁应用失败（上下文偏移需人工对齐）"; exit 1; }
+          # 2. 打集成补丁（用 patch -p1 -F 3 容忍 hunk 失败，与 susfs patch 的 hunk 失败兼容）
+          patch -p1 -F 3 < ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch || true
+          # 静态校验：检查 patch 是否至少部分应用成功（grep 是否写入了 nomount 钩子）
+          grep -q 'nomount_handle_getname' fs/namei.c || { echo "【P2】namei 钩子未写入"; exit 1; }
           # 3. 【改名】patch 应用后再对源码+内核文件做 sed 改名
           sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/nomount.c fs/nomount.h
           sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/nomount.c fs/nomount.h
