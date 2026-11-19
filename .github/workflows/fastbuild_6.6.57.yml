@@ -344,6 +344,14 @@ jobs:
               python3 /tmp/fix_ksud.py kernel/runtime/ksud_integration.c || { echo "[FATAL] ksud_integration 函数替换失败"; exit 1; }
               grep -q "int ksu_handle_execveat_ksud(int \*fd" kernel/runtime/ksud_integration.c || { echo "[FATAL] 新签名缺失"; exit 1; }
               if grep -q "ksu_stop_ksud_execve_hook\|void ksu_handle_execveat_ksud" kernel/runtime/ksud_integration.c; then echo "[FATAL] 旧签名/旧调用残留"; exit 1; fi
+              # 修复4（Run 44517189024 实证）：补丁删除了 hook/tp_marker.o 和 hook/arm64/patch_memory.o，
+              # 但 setuid_hook.c(ksu_clear_task_tracepoint_flag_if_needed)/mount_hide.c(ksu_patch_text) 仍调用→链接失败。恢复这两个对象
+              sed -i '/kernelsu-objs += hook\/setuid_hook.o/a kernelsu-objs += hook/tp_marker.o\nkernelsu-objs += hook/arm64/patch_memory.o' kernel/Kbuild
+              grep -q "hook/tp_marker.o" kernel/Kbuild || { echo "[FATAL] tp_marker 恢复失败"; exit 1; }
+              # 修复5（Run 44517189024 实证）：preinit.o 因 $(objtree)/usr/include 缺失未编译（KSU_NO_PREINIT），
+              # 但内核 fs/exec.c 调用 ksu_preinit_handle_post_execveat/ksu_setup_preinit_file→未定义。补丁的 stub 漏这2个，在 init.c 补
+              printf '\n#ifdef KSU_NO_PREINIT\nint ksu_preinit_handle_post_execveat(int *fd, struct filename **filename_ptr, void *argv_user, void *envp_user, int *flags, int *retval, int *preinit_fd) { return 0; }\nint ksu_setup_preinit_file(struct filename **filename_ptr, struct user_arg_ptr *argv_user) { return 0; }\n#endif\n' >> kernel/core/init.c
+              grep -q "ksu_preinit_handle_post_execveat" kernel/core/init.c || { echo "[FATAL] preinit stub 注入失败"; exit 1; }
               find . -name "*.orig" -delete 2>/dev/null || true
               find . -name "*.rej" -delete 2>/dev/null || true
               # 校验1：悬空引用必须清零
