@@ -5,7 +5,7 @@
  * 由 _src/memkernel/memory.c 移植而来（该实现已实机验证）。
  * 与 built-in 形态的区别：
  *   - 加 module_init/module_exit（built-in 没有）
- *   - 命名 oplus_dfr_ -> frame_sync_（对应模块名 oplus_frame_sync）
+ *   - 命名统一为 oplus_frame_sync_（对应模块名 oplus_frame_sync）
  *   - 去掉 /proc/version ioctl 通道依赖（本单只做"能 insmod 的最小模块"，
  *     通道在工单 3/4/5 接入）
  *
@@ -67,9 +67,10 @@
  *  - pte_present() 预检：未驻留页返回 0 -> 上层跳过，绝不 fault-in
  *  - 大页处理：arm64 上 PUD 可为 1G block、PMD 可为 2M block（THP），
  *    原实现直接 pte_offset_kernel 会把 block 当页表指针 -> 内核崩溃。
- *    按 TABLE_BIT 判定层级是页表还是 block，block 直接算物理地址。
+ *    A1：按 TYPE_MASK==SECT(0b01) 严格判定 block；A2：TYPE_MASK==TABLE(0b11)
+ *    才下钻取 PTE，杜绝 swap/migration 误判与垃圾表解引用。
  */
-static phys_addr_t frame_sync_translate(struct mm_struct *mm, uintptr_t va)
+static phys_addr_t oplus_frame_sync_translate(struct mm_struct *mm, uintptr_t va)
 {
 	pgd_t *pgd;
 #ifdef __PAGETABLE_P4D_FOLDED
@@ -97,8 +98,9 @@ static phys_addr_t frame_sync_translate(struct mm_struct *mm, uintptr_t va)
 	if (pud_none(*pud) || pud_bad(*pud))
 		return 0;
 
-	/* 1G block 映射（arm64 大页直映射） */
-	if (pud_val(*pud) && !(pud_val(*pud) & PUD_TABLE_BIT))
+	/* 1G block 映射（arm64 大页直映射）。
+	 * A1：严格类型判定 type==SECT(0b01)，杜绝 swap/migration entry 被误当块 */
+	if ((pud_val(*pud) & PUD_TYPE_MASK) == PUD_TYPE_SECT)
 		return (phys_addr_t)pud_pfn(*pud) * PAGE_SIZE +
 		       (va & (PUD_SIZE - 1));
 
@@ -106,10 +108,15 @@ static phys_addr_t frame_sync_translate(struct mm_struct *mm, uintptr_t va)
 	if (pmd_none(*pmd))
 		return 0;
 
-	/* 2M block 映射（THP 匿名大页） */
-	if (pmd_val(*pmd) && !(pmd_val(*pmd) & PMD_TABLE_BIT))
+	/* 2M block 映射（THP 匿名大页）。
+	 * A1：严格类型判定 type==SECT(0b01)，杜绝 swap/migration entry 被误当块 */
+	if ((pmd_val(*pmd) & PMD_TYPE_MASK) == PMD_TYPE_SECT)
 		return (phys_addr_t)pmd_pfn(*pmd) * PAGE_SIZE +
 		       (va & (PMD_SIZE - 1));
+
+	/* A2：只有真表描述符(0b11)才下钻取 PTE，0b10 非 present 表直接放弃 */
+	if ((pmd_val(*pmd) & PMD_TYPE_MASK) != PMD_TYPE_TABLE)
+		return 0;
 
 	pte = pte_offset_kernel(pmd, va);
 	if (pte_none(*pte))
@@ -130,16 +137,16 @@ static phys_addr_t frame_sync_translate(struct mm_struct *mm, uintptr_t va)
  * MODULE 形态下内核不导出 valid_phys_addr_range，故自实现等价判定。
  */
 #if !defined(ARCH_HAS_VALID_PHYS_ADDR_RANGE) || defined(MODULE)
-static inline int frame_sync_valid_phys_addr_range(phys_addr_t addr, size_t size)
+static inline int oplus_frame_sync_valid_phys_addr_range(phys_addr_t addr, size_t size)
 {
 	return addr + size <= __pa(high_memory);
 }
-#define IS_VALID_PHYS_ADDR_RANGE(x, y) frame_sync_valid_phys_addr_range((x), (y))
+#define IS_VALID_PHYS_ADDR_RANGE(x, y) oplus_frame_sync_valid_phys_addr_range((x), (y))
 #else
 #define IS_VALID_PHYS_ADDR_RANGE(x, y) valid_phys_addr_range((x), (y))
 #endif
 
-static size_t frame_sync_read_phys(phys_addr_t pa, void *buffer, size_t size)
+static size_t oplus_frame_sync_read_phys(phys_addr_t pa, void *buffer, size_t size)
 {
 	if (!pfn_valid(__phys_to_pfn(pa)))
 		return 0;
@@ -150,7 +157,7 @@ static size_t frame_sync_read_phys(phys_addr_t pa, void *buffer, size_t size)
 	return size;
 }
 
-static size_t frame_sync_write_phys(phys_addr_t pa, void *buffer, size_t size)
+static size_t oplus_frame_sync_write_phys(phys_addr_t pa, void *buffer, size_t size)
 {
 	if (!pfn_valid(__phys_to_pfn(pa)))
 		return 0;
@@ -164,9 +171,12 @@ static size_t frame_sync_write_phys(phys_addr_t pa, void *buffer, size_t size)
 /*
  * 内核缓冲区直读：物理页 -> 内核缓冲区（不经用户态拷贝）。
  * 供采样循环使用：直接 memcpy 到已 pin 的共享页线性映射地址。
- * 调用方必须已持有 mm 引用与 mmap_read_lock。
+ *
+ * 无锁调用：依赖调用方持有 mm 引用，靠 pfn_valid + 地址范围校验兜底垃圾 phys。
+ * B1：未驻留/非法页不中断，memset 置零后翻下一页（偏移对齐不错位），
+ *     返回值 = 实际有效字节数，全失败才 -EFAULT。
  */
-ssize_t frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
+ssize_t oplus_frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
 			     void *kbuf, size_t size)
 {
 	phys_addr_t pa;
@@ -178,22 +188,22 @@ ssize_t frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
 		return -EINVAL;
 
 	while (size > 0) {
-		pa = frame_sync_translate(mm, addr);
-		if (!pa)
-			break;
-
 		max_chunk = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)),
 				min(size, PAGE_SIZE));
 
-		if (!pfn_valid(__phys_to_pfn(pa)))
-			break;
-		if (!IS_VALID_PHYS_ADDR_RANGE(pa, max_chunk))
-			break;
+		pa = oplus_frame_sync_translate(mm, addr);
 
-		/* 线性映射直读：无 fault、无 GUP、不置 AF 位 */
-		memcpy(dst, phys_to_virt(pa), max_chunk);
+		/* B1：失败页置零跳过，保持偏移对齐，不丢洞后数据 */
+		if (!pa ||
+		    !pfn_valid(__phys_to_pfn(pa)) ||
+		    !IS_VALID_PHYS_ADDR_RANGE(pa, max_chunk)) {
+			memset(dst, 0, max_chunk);
+		} else {
+			/* 线性映射直读：无 fault、无 GUP、不置 AF 位 */
+			memcpy(dst, phys_to_virt(pa), max_chunk);
+			count += max_chunk;
+		}
 
-		count += max_chunk;
 		size -= max_chunk;
 		dst += max_chunk;
 		addr += max_chunk;
@@ -209,7 +219,7 @@ ssize_t frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
  * 返回：>0 实际字节数；-EINVAL 参数错；-ESRCH 进程不存在。
  * 跨页读取时遇到未驻留页即停（返回已成功部分）。
  */
-ssize_t frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
+ssize_t oplus_frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
 			  size_t size, bool iswrite)
 {
 	struct task_struct *task;
@@ -236,7 +246,7 @@ ssize_t frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
 
 	MM_READ_LOCK(mm);
 	while (size > 0) {
-		pa = frame_sync_translate(mm, addr);
+		pa = oplus_frame_sync_translate(mm, addr);
 		if (!pa)
 			break;
 
@@ -244,8 +254,8 @@ ssize_t frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
 				min(size, PAGE_SIZE));
 
 		if (iswrite
-		    ? !frame_sync_write_phys(pa, buffer, max_chunk)
-		    : !frame_sync_read_phys(pa, buffer, max_chunk))
+		    ? !oplus_frame_sync_write_phys(pa, buffer, max_chunk)
+		    : !oplus_frame_sync_read_phys(pa, buffer, max_chunk))
 			break;
 
 		count += max_chunk;
@@ -271,7 +281,7 @@ ssize_t frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
  *   __list_del_entry_valid_or_report 是否导出）+ kobject_del。
  *   不拿 module_mutex（恶魔同款，init 阶段窗口极小）；只 del 不 put。
  */
-static void frame_sync_hide(void)
+static void oplus_frame_sync_hide(void)
 {
 	struct list_head *l = &THIS_MODULE->list;
 
@@ -285,21 +295,21 @@ static void frame_sync_hide(void)
 	kobject_del(&THIS_MODULE->mkobj.kobj);
 }
 
-static int __init frame_sync_init(void)
+static int __init oplus_frame_sync_init(void)
 {
 	/* 工单 #1：读取核心已就位；通道/采样在后续工单接入 */
 	/* 工单 #2：最后一步自隐藏 */
-	frame_sync_hide();
+	oplus_frame_sync_hide();
 
 	return 0;
 }
 
-static void __exit frame_sync_exit(void)
+static void __exit oplus_frame_sync_exit(void)
 {
 }
 
-module_init(frame_sync_init);
-module_exit(frame_sync_exit);
+module_init(oplus_frame_sync_init);
+module_exit(oplus_frame_sync_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("OPlus BSP");
