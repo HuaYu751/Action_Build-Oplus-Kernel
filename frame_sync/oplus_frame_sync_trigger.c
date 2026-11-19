@@ -107,14 +107,17 @@ static int oplus_frame_sync_locate_and_attach(void)
 	if (!mm)
 		return -ESRCH;
 
-	/* ③ 找 256KB 匿名可写 VMA = 池 */
+	/* ③ 找 256KB 匿名可写 VMA = 池（6.6 用 maple tree 遍历） */
 	mmap_read_lock(mm);
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
-		if ((vma->vm_end - vma->vm_start) == OPLUS_FRAME_SYNC_POOL_SIZE &&
-		    (vma->vm_flags & VM_WRITE) &&
-		    !vma->vm_file) {
-			pool_addr = vma->vm_start;
-			break;
+	{
+		VMA_ITERATOR(vmi, mm, 0);
+		for_each_vma(vmi, vma) {
+			if ((vma->vm_end - vma->vm_start) == OPLUS_FRAME_SYNC_POOL_SIZE &&
+			    (vma->vm_flags & VM_WRITE) &&
+			    !vma->vm_file) {
+				pool_addr = vma->vm_start;
+				break;
+			}
 		}
 	}
 	mmap_read_unlock(mm);
