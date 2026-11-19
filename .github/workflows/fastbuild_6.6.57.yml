@@ -5,7 +5,7 @@ env:
   ANDROID_VERSION: 'android15'
   KERNEL_VERSION: '6.6'
   SUB_VERSION: '57'
-  KERNEL_NAME: 'android15-8-g7b1f455c7143-ab13591283-4k'  # P1: 对齐原厂 801 boot.img 提取串
+  KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
   CCACHE_KEY: ccache-ecsv4-6.6.57
 
 on:
@@ -31,12 +31,12 @@ on:
         description: '是否开启kpm(使用KpatchNext独立实现kpm(支持任意KSU/面具环境); 不需要可保持默认关闭)'
         required: true
         type: boolean
-        default: 'true'  # P1: 与设备现役内核一致（带 KPM）
+        default: 'false'
       lz4_enable:
         description: '是否安装 lz4 1.10.0+zstd 1.5.7 补丁'
         required: true
         type: boolean
-        default: 'false'
+        default: 'true'
       lz4kd_enable:
         description: '是否安装 LZ4KD 补丁(若已开启lz4+zstd补丁则可不开启)'
         required: true
@@ -77,31 +77,6 @@ on:
         default: 'false'
       baseband_guard:
         description: '是否开启内核级基带保护(阻止一切对非用户分区的写入，有效防止格机)'
-        required: true
-        type: boolean
-        default: 'true'
-      oplus_dfr_enable:
-        description: '【P3】memkernel 已摘出改 B 类驱动，此选项保留为 false（兼容旧调用方）'
-        required: true
-        type: boolean
-        default: 'false'
-      pathmask_builtin_enable:
-        description: '【P3-A】是否内置 VFS 控制模块(原 LKM 改 built-in; 消除 /proc/modules OE 痕迹)'
-        required: true
-        type: boolean
-        default: 'true'
-      fgetpriority_builtin_enable:
-        description: '【P3-B】是否内置 UID 控制模块(原 LKM 改 built-in; 消除 /proc/modules OE 痕迹)'
-        required: true
-        type: boolean
-        default: 'true'
-      nomount_enable:
-        description: '【P2】是否内置 NoMount 引擎(CONFIG_NOMOUNT=y; 装 meta-nomount 用户态模块时开启, 与 hybrid_mount 互斥; v2.2.2 起默认开启并编译期关闭调试日志)'
-        required: true
-        type: boolean
-        default: 'true'
-      kallsyms_filter_enable:
-        description: '【P5】是否过滤 /proc/kallsyms 中我们的符号(P2/P3 内置后必须开启; 会增量重编 Image, 耗时翻倍)'
         required: true
         type: boolean
         default: 'true'
@@ -324,34 +299,8 @@ jobs:
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             cd ./common
-            # 原样应用 patch（不在 patch 文件上做 sed，避免上下文不匹配）
             patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
             patch -p1 -N -F 3 < 69_hide_stuff.patch || true
-            # 【方案C】susfs 编译期 -D 宏重命名（BakaSU susfs_compat.mk 同款范式）：
-            # 源码/头文件/BakaSU 零改动，预处理阶段全编译单元同步替换，上游更新自动兼容。
-            # 改名对象=函数/变量/结构体标识符；排除项=#define 宏（防 redefinition）与 susfs_def 头文件名。
-            SUSFS_MACROS=$(grep -ohE '#define[[:space:]]+SUSFS_[A-Z0-9_]+' include/linux/susfs.h include/linux/susfs_def.h fs/susfs.c 2>/dev/null | awk '{print $2}' | sort -u)
-            # 名单来源全覆盖：susfs 实现三件套 + patch 注入的全部内核文件 + BakaSU 调用侧（防漏符号导致链接失败）
-            SRCS="include/linux/susfs.h include/linux/susfs_def.h fs/susfs.c"
-            for f in $(grep -oE '^\+\+\+ b/[^[:space:]]+' 50_add_susfs_in_gki-*.patch 2>/dev/null | sed 's#^+++ b/##'); do
-              [ -f "$f" ] && SRCS="$SRCS $f"
-            done
-            [ -d ../KernelSU/kernel ] && SRCS="$SRCS $(find ../KernelSU/kernel -name '*.c' -o -name '*.h' 2>/dev/null | tr '\n' ' ')"
-            DEFS=""
-            for s in $(grep -ohE '\bsusfs_[A-Za-z0-9_]+' $SRCS 2>/dev/null | sort -u | grep -vx 'susfs_def'); do
-              case " $SUSFS_MACROS " in *" $s "*) continue ;; esac
-              DEFS="$DEFS -D${s}=oplus_bsp_dfr_map_ctl_${s#susfs_}"
-            done
-            for s in $(grep -ohE '\bst_susfs_[A-Za-z0-9_]+' $SRCS 2>/dev/null | sort -u); do
-              DEFS="$DEFS -D${s}=st_oplus_bsp_dfr_map_ctl_${s#st_susfs_}"
-            done
-            for s in sus_path sus_mount sus_kstat sus_map sus_path_uid_filter_bitmap; do
-              DEFS="$DEFS -D${s}=oplus_bsp_dfr_map_${s#sus_}"
-            done
-            echo "SUSFS_RENAME_DEFS=$DEFS" >> $GITHUB_ENV
-            echo "【方案C】susfs 编译期改名宏: $(echo $DEFS | wc -w) 个（含 BakaSU 调用侧）"
-            # hide_stuff 函数改名（纯内核内部，无 KSU 依赖，patch 应用后改 task_mmu.c）
-            sed -i 's/show_vma_header_prefix_fake/oplus_bsp_dfr_kstat_show_vma/g' fs/proc/task_mmu.c 2>/dev/null || true
             cd ..
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
@@ -405,7 +354,7 @@ jobs:
           echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=n" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -523,9 +472,9 @@ jobs:
             # 应用 Droidspaces 容器必须补丁
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch
             patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch || true
-            # 修补 droidspaces 行为，避免开机崩溃
-            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_droidspaces.patch
-            patch -p1 -F 3 < fix_droidspaces.patch || true
+            # 修补 oplus_bsp_midas 行为，避免开机崩溃
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_oplus_bsp_midas.patch
+            patch -p1 -F 3 < fix_oplus_bsp_midas.patch || true
             # 应用 NTSync 补丁
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_base.patch
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
@@ -588,172 +537,6 @@ jobs:
           curl -sSL https://github.com/cctv18/Baseband-guard/raw/master/setup.sh | bash
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
 
-      - name: 【P2】内置 NoMount 引擎
-        if: inputs.nomount_enable
-        run: |
-          cd kernel_workspace
-          if [ ! -d "$GITHUB_ACTOR" ]; then
-            git clone --depth=1 https://github.com/$GITHUB_REPOSITORY.git -b $GITHUB_REF_NAME $GITHUB_ACTOR
-          fi
-          cd common
-          echo "【P2】集成 NoMount 引擎（改名 oplus_bsp_dfr_task_ctl）..."
-          # 1. 引擎源码放入 fs/（保持文件名 nomount.c/.h 不改）
-          cp ../$GITHUB_ACTOR/nomount_kernel/nomount.c ../$GITHUB_ACTOR/nomount_kernel/nomount.h fs/
-          # 1.1 编译期关闭调试日志
-          sed -i 's|#define nm_debug(fmt, ...) printk.*|#define nm_debug(fmt, ...) do {} while (0)|' fs/nomount.c
-          # 2. 打集成补丁（用 patch -p1 -F 3 容忍 hunk 失败，与 susfs patch 的 hunk 失败兼容）
-          patch -p1 -F 3 < ../$GITHUB_ACTOR/nomount_kernel/nomount_6.6_kernel_integration.patch || true
-          # 静态校验：检查 patch 是否至少部分应用成功（grep 是否写入了 nomount 钩子）
-          grep -q 'nomount_handle_getname' fs/namei.c || { echo "【P2】namei 钩子未写入"; exit 1; }
-          # 3. 【改名】patch 应用后再对源码+内核文件做 sed 改名
-          sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/nomount.c fs/nomount.h
-          sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/nomount.c fs/nomount.h
-          sed -i 's/\bNM_/OPLUS_BSP_DFR_TASK_/g' fs/nomount.c fs/nomount.h
-          sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' fs/nomount.c fs/nomount.h
-          sed -i 's/"nomount"/"oplus_bsp_dfr_task_nl"/g' fs/nomount.c fs/nomount.h
-          # 同步改 patch 写入到内核文件的 nomount 引用
-          sed -i 's/nomount_/oplus_bsp_dfr_task_ctl_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c fs/Kconfig fs/Makefile 2>/dev/null || true
-          sed -i 's/\bnm_/oplus_bsp_dfr_task_/g' fs/namei.c fs/d_path.c fs/readdir.c fs/stat.c fs/statfs.c fs/proc/task_mmu.c 2>/dev/null || true
-          sed -i 's/NOMOUNT_/OPLUS_BSP_DFR_TASK_CTL_/g' fs/Kconfig fs/Makefile 2>/dev/null || true
-          sed -i 's/CONFIG_NOMOUNT/CONFIG_OPLUS_BSP_DFR_TASK_CTL/g' fs/Kconfig fs/Makefile arch/arm64/configs/gki_defconfig 2>/dev/null || true
-          # Kconfig 符号定义行单独改名（config NOMOUNT 不匹配上面任何规则，Run#10 P2 失败根因）
-          sed -i 's/^config NOMOUNT$/config OPLUS_BSP_DFR_TASK_CTL/' fs/Kconfig
-          # 4. defconfig
-          echo "CONFIG_OPLUS_BSP_DFR_TASK_CTL=y" >> arch/arm64/configs/gki_defconfig
-          # 5. 静态校验（用新名字）
-          grep -q 'config OPLUS_BSP_DFR_TASK_CTL' fs/Kconfig || { echo "【P2】fs/Kconfig 未生效"; exit 1; }
-          grep -q 'nomount.o' fs/Makefile || { echo "【P2】fs/Makefile 未生效"; exit 1; }
-          grep -q 'oplus_bsp_dfr_task_ctl_handle_getname' fs/namei.c || { echo "【P2】namei 钩子未生效"; exit 1; }
-          echo "【P2】NoMount 集成完成：改名 oplus_bsp_dfr_task_ctl / patch 原样应用后改源码 / genl 改名"
-
-      - name: 【P3-A】内置 VFS 控制模块
-        if: inputs.pathmask_builtin_enable
-        run: |
-          cd kernel_workspace/common
-          echo "【P3-A】集成 VFS 控制模块 built-in..."
-          git clone --depth=1 https://github.com/Andrea-lyz/LKM-PathMask.git /tmp/vfs_src 2>/dev/null
-          mkdir -p drivers/oplus_bsp_dfr_inode_ctl
-          cp /tmp/vfs_src/kernel/src/pathmask.c drivers/oplus_bsp_dfr_inode_ctl/vfs_ctl.c
-          # 获取 KallRecon 依赖（P1：必须一起编进内核）
-          cd /tmp/vfs_src/kernel && sh scripts/fetch-deps.sh 2>/dev/null || true; cd -
-          # 复制 KallRecon 源码和头文件（尝试多种可能路径）
-          find /tmp/vfs_src/kernel -name '*.c' -o -name '*.h' 2>/dev/null | while read f; do
-            case "$f" in
-              */pathmask.c) ;;  # 已复制为 vfs_ctl.c
-              *) cp "$f" drivers/oplus_bsp_dfr_inode_ctl/ 2>/dev/null || true ;;
-            esac
-          done
-          # 彻底清除原项目名：pathmask → oplus_bsp_dfr_inode_ctl
-          sed -i 's/pathmask/oplus_bsp_dfr_inode_ctl/g' drivers/oplus_bsp_dfr_inode_ctl/*.c
-          sed -i 's/pathmask/oplus_bsp_dfr_inode_ctl/g' drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          sed -i 's/PathMask/OplusBspDfrInodeCtl/g' drivers/oplus_bsp_dfr_inode_ctl/*.c drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          sed -i 's/PATHMASK/OPLUS_BSP_DFR_INODE_CTL/g' drivers/oplus_bsp_dfr_inode_ctl/*.c drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          # KallRecon 符号也改前缀（消除 kallrecon 痕迹）
-          sed -i 's/kallrecon/oplus_bsp_dfr_symres/g' drivers/oplus_bsp_dfr_inode_ctl/*.c drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          sed -i 's/KallRecon/OplusBspDfrSymres/g' drivers/oplus_bsp_dfr_inode_ctl/*.c drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          sed -i 's/KALLRECON/OPLUS_BSP_DFR_SYMRES/g' drivers/oplus_bsp_dfr_inode_ctl/*.c drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          # pm_ 前缀 → oplus_bsp_dfr_inode_ctl_
-          for fn in pm_invoke_kern_path pm_invoke_path_put pm_invoke_close_fd pm_resolve \
-                    pm_symrecon_init pm_is_write_class_syscall pm_apply_hide_errno \
-                    pm_target_prefix_match pm_storage_candidates pm_storage_roots \
-                    pm_storage_root_count pm_kern_path pm_path_put pm_close_fd \
-                    pm_perm_seen pm_getattr_seen pm_syscall_seen pm_syscall_probes \
-                    pm_write_seen pm_write_probes; do
-            newfn=$(echo "$fn" | sed 's/^pm_/oplus_bsp_dfr_inode_ctl_/')
-            sed -i "s/\b${fn}\b/${newfn}/g" drivers/oplus_bsp_dfr_inode_ctl/*.c drivers/oplus_bsp_dfr_inode_ctl/*.h 2>/dev/null || true
-          done
-          # P2：MODULE_AUTHOR / DESCRIPTION 改原厂风格
-          sed -i 's/MODULE_AUTHOR([^)]*)/MODULE_AUTHOR("OPlus BSP")/' drivers/oplus_bsp_dfr_inode_ctl/*.c
-          sed -i 's/MODULE_DESCRIPTION([^)]*)/MODULE_DESCRIPTION("OPlus BSP VFS control")/' drivers/oplus_bsp_dfr_inode_ctl/*.c
-          # F3：配置路径 /data/adb/pathmask → /data/adb/oplus_bsp_dfr_inode_ctl（用户选改路径+迁移）
-          #     sed 已经把 pathmask→oplus_bsp_dfr_inode_ctl，所以路径自动变成 /data/adb/oplus_bsp_dfr_inode_ctl/
-          #     用户需迁移现有配置：mv /data/adb/pathmask/* /data/adb/oplus_bsp_dfr_inode_ctl/
-          # F5：重命名 KallRecon 头文件（core.h/hint.h 可能含 kallrecon 字样）
-          #     如果头文件名不含 kallrecon，保持原名；含则改名 + sed 已改 include 名
-          for h in drivers/oplus_bsp_dfr_inode_ctl/*.h; do
-            [ -f "$h" ] || continue
-            base=$(basename "$h")
-            newbase=$(echo "$base" | sed 's/pathmask/oplus_bsp_dfr_inode_ctl/g; s/kallrecon/oplus_bsp_dfr_symres/g')
-            [ "$base" != "$newbase" ] && mv "$h" "drivers/oplus_bsp_dfr_inode_ctl/$newbase"
-          done
-          # Kconfig + Makefile
-          printf 'config OPLUS_BSP_DFR_INODE_CTL\n\tbool "OPlus BSP VFS control"\n\tdefault y\n\thelp\n\t  OPlus BSP VFS access control subsystem.\n' > drivers/oplus_bsp_dfr_inode_ctl/Kconfig
-          echo 'obj-$(CONFIG_OPLUS_BSP_DFR_INODE_CTL) += oplus_bsp_dfr_inode_ctl.o' > drivers/oplus_bsp_dfr_inode_ctl/Makefile
-          echo 'oplus_bsp_dfr_inode_ctl-y := vfs_ctl.o' >> drivers/oplus_bsp_dfr_inode_ctl/Makefile
-          for f in drivers/oplus_bsp_dfr_inode_ctl/*.c; do
-            base=$(basename "$f" .c)
-            [ "$base" != "vfs_ctl" ] && echo "oplus_bsp_dfr_inode_ctl-y += ${base}.o" >> drivers/oplus_bsp_dfr_inode_ctl/Makefile
-          done
-          grep -q 'oplus_bsp_dfr_inode_ctl' drivers/Makefile || echo 'obj-$(CONFIG_OPLUS_BSP_DFR_INODE_CTL) += oplus_bsp_dfr_inode_ctl/' >> drivers/Makefile
-          grep -q 'oplus_bsp_dfr_inode_ctl/Kconfig' drivers/Kconfig || echo 'source "drivers/oplus_bsp_dfr_inode_ctl/Kconfig"' >> drivers/Kconfig
-          echo "CONFIG_OPLUS_BSP_DFR_INODE_CTL=y" >> arch/arm64/configs/gki_defconfig
-          sed -i 's/\bpr_info\b/pr_debug/g' drivers/oplus_bsp_dfr_inode_ctl/*.c 2>/dev/null || true
-          # 验证零残留
-          if grep -riE '\b(pathmask|PathMask|PATHMASK|kallrecon|KallRecon)\b' drivers/oplus_bsp_dfr_inode_ctl/ 2>/dev/null; then
-            echo "【P3-A】FAIL：仍有原项目名残留"; grep -riE '\b(pathmask|kallrecon)\b' drivers/oplus_bsp_dfr_inode_ctl/; exit 1
-          fi
-          rm -rf /tmp/vfs_src
-          echo "【P3-A】VFS 控制模块集成完成：built-in / 零原项目名 / KallRecon 改名 / 调试关闭"
-
-      - name: 【P3-B】内置 UID 控制模块
-        if: inputs.fgetpriority_builtin_enable
-        run: |
-          cd kernel_workspace/common
-          echo "【P3-B】集成 UID 控制模块 built-in..."
-          git clone --depth=1 https://github.com/Anatdx/hma-uidfake.git /tmp/uid_src 2>/dev/null
-          mkdir -p drivers/oplus_bsp_dfr_sched_guard
-          # 源文件改名（不留 uidfake/hma 痕迹）
-          cp /tmp/uid_src/src/main.c    drivers/oplus_bsp_dfr_sched_guard/uid_main.c
-          cp /tmp/uid_src/src/hooks.c   drivers/oplus_bsp_dfr_sched_guard/uid_hooks.c
-          cp /tmp/uid_src/src/lsm.c     drivers/oplus_bsp_dfr_sched_guard/uid_lsm.c
-          cp /tmp/uid_src/src/netlink.c drivers/oplus_bsp_dfr_sched_guard/uid_netlink.c
-          cp /tmp/uid_src/src/patch.c   drivers/oplus_bsp_dfr_sched_guard/uid_patch.c
-          # F1 修复：policy.c 保持原名（不含 uidfake/kaux，不需要改名；hooks.c #include "policy.c" 能找到）
-          cp /tmp/uid_src/src/policy.c  drivers/oplus_bsp_dfr_sched_guard/policy.c
-          cp /tmp/uid_src/src/include/*.h drivers/oplus_bsp_dfr_sched_guard/ 2>/dev/null || true
-          cp /tmp/uid_src/include/*.h drivers/oplus_bsp_dfr_sched_guard/ 2>/dev/null || true
-          # 彻底清除原项目名
-          sed -i 's/uidfake/oplus_bsp_dfr_sched_guard/g' drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          sed -i 's/UIDFAKE/OPLUS_BSP_DFR_SCHED_GUARD/g' drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          sed -i 's/UidFake/OplusBspDfrSchedGuard/g' drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          # U3：KAUX_ 宏全改 → OPLUS_BSP_DFR_NL_；family 名 "kaux" → "oplus_bsp_dfr_nl"
-          sed -i 's/KAUX_/OPLUS_BSP_DFR_NL_/g' drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          sed -i 's/kaux_family/oplus_bsp_dfr_nl_family/g' drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          sed -i 's/kaux/oplus_bsp_dfr_nl/g' drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          # U4：MODULE_AUTHOR / DESCRIPTION 改原厂风格
-          sed -i 's/MODULE_AUTHOR([^)]*)/MODULE_AUTHOR("OPlus BSP")/' drivers/oplus_bsp_dfr_sched_guard/*.c
-          sed -i 's/MODULE_DESCRIPTION([^)]*)/MODULE_DESCRIPTION("OPlus BSP UID control")/' drivers/oplus_bsp_dfr_sched_guard/*.c
-          # 通用函数名改名
-          for fn in hooks_install hooks_remove netlink_init netlink_exit \
-                    policy_apply policy_free policy_init policy_lookup_as; do
-            newfn=$(echo "$fn" | sed 's/^/oplus_bsp_dfr_sched_guard_/')
-            sed -i "s/\b${fn}\b/${newfn}/g" drivers/oplus_bsp_dfr_sched_guard/*.c drivers/oplus_bsp_dfr_sched_guard/*.h 2>/dev/null || true
-          done
-          # F2 修复：kmi_compat.h 保持原名（不含 uidfake/kaux）；但 include guard UIDFAKE_KMI_COMPAT_H 已被上面 sed 改掉
-          # F1 确认：hooks.c #include "policy.c" 能找到 policy.c（保持原名）
-          # 头文件改名：只改含原项目名的（uidfake.h→oplus_bsp_dfr_sched_guard.h，kaux.h→oplus_bsp_dfr_nl.h）
-          # kmi_compat.h 不含原项目名，保持原名不改（F2 修复）
-          for h in drivers/oplus_bsp_dfr_sched_guard/*.h; do
-            [ -f "$h" ] || continue
-            base=$(basename "$h")
-            newbase=$(echo "$base" | sed 's/uidfake/oplus_bsp_dfr_sched_guard/g; s/kaux/oplus_bsp_dfr_nl/g')
-            [ "$base" != "$newbase" ] && mv "$h" "drivers/oplus_bsp_dfr_sched_guard/$newbase"
-          done
-          # Kconfig + Makefile（F1：policy.c 不单独列 .o，它被 hooks.c #include 编译）
-          printf 'config OPLUS_BSP_DFR_SCHED_GUARD\n\tbool "OPlus BSP UID control"\n\tdefault y\n\thelp\n\t  OPlus BSP UID access control subsystem.\n' > drivers/oplus_bsp_dfr_sched_guard/Kconfig
-          echo 'obj-$(CONFIG_OPLUS_BSP_DFR_SCHED_GUARD) += oplus_bsp_dfr_sched_guard.o' > drivers/oplus_bsp_dfr_sched_guard/Makefile
-          echo 'oplus_bsp_dfr_sched_guard-y := uid_main.o uid_hooks.o uid_lsm.o uid_netlink.o uid_patch.o' >> drivers/oplus_bsp_dfr_sched_guard/Makefile
-          grep -q 'oplus_bsp_dfr_sched_guard' drivers/Makefile || echo 'obj-$(CONFIG_OPLUS_BSP_DFR_SCHED_GUARD) += oplus_bsp_dfr_sched_guard/' >> drivers/Makefile
-          grep -q 'oplus_bsp_dfr_sched_guard/Kconfig' drivers/Kconfig || echo 'source "drivers/oplus_bsp_dfr_sched_guard/Kconfig"' >> drivers/Kconfig
-          echo "CONFIG_OPLUS_BSP_DFR_SCHED_GUARD=y" >> arch/arm64/configs/gki_defconfig
-          sed -i 's/\bpr_info\b/pr_debug/g' drivers/oplus_bsp_dfr_sched_guard/*.c 2>/dev/null || true
-          # 验证零残留（用词边界避免 hmac/hmat 等误报）
-          if grep -riE '\b(uidfake|UidFake|UIDFAKE|kaux|KAUX)\b' drivers/oplus_bsp_dfr_sched_guard/ 2>/dev/null; then
-            echo "【P3-B】FAIL：仍有原项目名残留"; grep -riE '\b(uidfake|kaux)\b' drivers/oplus_bsp_dfr_sched_guard/; exit 1
-          fi
-          rm -rf /tmp/uid_src
-          echo "【P3-B】UID 控制模块集成完成：built-in / 零原项目名 / 头文件改名 / policy.c 不单独编译 / 调试关闭"
-
       - name: 添加制作名称
         run: |
           cd kernel_workspace
@@ -776,15 +559,6 @@ jobs:
            
       - name: 构建内核
         run: |
-          # P1: 痕迹对齐——让 /proc/version 与原厂串一字不差（任务书第一节）
-          echo "KBUILD_BUILD_USER=kleaf" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_HOST=build-host" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_TIMESTAMP=Tue Jun  3 03:22:33 UTC 2025" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
-          export KBUILD_BUILD_USER=kleaf
-          export KBUILD_BUILD_HOST=build-host
-          export KBUILD_BUILD_TIMESTAMP="Tue Jun  3 03:22:33 UTC 2025"
-          export KBUILD_BUILD_VERSION=1
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
@@ -855,7 +629,7 @@ jobs:
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error KCFLAGS+="${{ env.SUSFS_RENAME_DEFS }}" Image
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
@@ -866,37 +640,6 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
-
-      - name: 【P5】kallsyms 符号过滤（9-B 方案）
-        if: inputs.kallsyms_filter_enable
-        run: |
-          cd kernel_workspace
-          # 确保自仓库已克隆
-          if [ ! -d "$GITHUB_ACTOR" ]; then
-            git clone --depth=1 https://github.com/$GITHUB_REPOSITORY.git -b $GITHUB_REF_NAME $GITHUB_ACTOR
-          fi
-          cd common
-          echo "【P5】kallsyms 输出过滤：生成过滤表 → 打补丁 → 增量重编"
-          # B1: 从 vmlinux 生成 include/generated/hidden_syms.h
-          chmod +x ../$GITHUB_ACTOR/scripts/p5_gen_hidden_syms.sh
-          bash ../$GITHUB_ACTOR/scripts/p5_gen_hidden_syms.sh out/vmlinux include/generated/hidden_syms.h || {
-            rc=$?
-            if [ $rc -eq 2 ]; then
-              echo "【P5】过滤表为空（P2/P3 未开），无需过滤，跳过"
-              exit 0
-            fi
-            echo "【P5】生成过滤表失败"; exit 1;
-          }
-          # B2: 锚点插入过滤（幂等），目标文件是 kernel/kallsyms.c（6.6 树在此，不在 fs/proc/）
-          python3 ../$GITHUB_ACTOR/scripts/p5_patch_kallsyms.py kernel/kallsyms.c || { echo "【P5】kallsyms.c 打补丁失败"; exit 1; }
-          grep -q 'kallsyms_is_hidden' kernel/kallsyms.c || { echo "【P5】补丁未生效"; exit 1; }
-          # B3: 增量重编 Image（复用构建工具链与 ccache，分钟级）
-          WORKDIR="$(pwd)/.."
-          export PATH="$WORKDIR/clang18/bin:$WORKDIR/build-tools/bin:/usr/lib/ccache:$PATH"
-          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error KCFLAGS+="${{ env.SUSFS_RENAME_DEFS }}" Image || { echo "【P5】增量重编失败"; exit 1; }
-          ls -lh out/arch/arm64/boot/Image
-          echo "【P5】完成：/proc/kallsyms 输出将跳过过滤表内全部符号"
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'

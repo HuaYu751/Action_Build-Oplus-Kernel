@@ -1,8 +1,0 @@
-config OPLUS_DFR
-    bool "Physical Mem Operation Driver (built-in only)"
-    default y
-    help
-      Read-Write physical memory of target process.
-      Built-in only (Y): no /proc/modules entry, no taint, no /dev node.
-      Communication channel is attached to /proc/version proc_ops ioctl.
-      Do NOT set to M — module form defeats the hiding design.
