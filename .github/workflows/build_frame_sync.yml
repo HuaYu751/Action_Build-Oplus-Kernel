@@ -1,0 +1,128 @@
+name: Build frame_sync.ko（完整符号验证）
+
+# 工单 #1 dry-run：验证 oplus_frame_sync 读取核心移植成 .ko 后
+#   ① 源码能编译通过  ② 符号 CRC 与实机内核一致（完整 modpost 解析）
+#
+# 原理：frame_sync 引用的符号（find_get_pid/get_task_mm/mmput/copy_to_user/
+#   pfn_valid 等）全是 GKI 基础符号，SUSFS/SukiSU 补丁不影响其 CRC，
+#   因此用纯净 common 树 + 删 ABI 保护后编一次内核即可完成符号验证，
+#   不需要打生产用的 SukiSU/SUSFS/VFS/KPM 补丁。
+#
+# 触发：GitHub 仓库 Actions → 本 workflow → Run workflow（无需参数）
+# 前置：仓库根目录有 frame_sync/oplus_frame_sync.{c,h} 与 frame_sync/Makefile
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout 仓库（取 frame_sync 源码）
+        uses: actions/checkout@v4
+
+      - name: 下载内核源码树 + clang18 工具链
+        run: |
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev unzip aria2
+
+          rm -rf kernel_workspace
+          mkdir kernel_workspace
+          cd kernel_workspace
+
+          echo "=== 下载 common 源码树（android_kernel_common_oneplus_sm8750）==="
+          aria2c -s16 -x16 -k1M \
+            https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_15.0.1_pad_2_pro.zip \
+            -o common.zip
+          unzip -q common.zip
+          mv "android_kernel_common_oneplus_sm8750-oneplus-sm8750_v_15.0.1_pad_2_pro" common
+          rm -f common.zip
+
+          echo "=== 下载 clang18 工具链 ==="
+          mkdir -p clang18
+          aria2c -s16 -x16 -k1M \
+            https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip \
+            -o clang.zip
+          unzip -q clang.zip -d clang18
+          rm -f clang.zip
+
+          echo "=== 下载 build-tools（含 aarch64-linux-gnu- 交叉 binutils）==="
+          aria2c -s16 -x16 -k1M \
+            https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip \
+            -o build-tools.zip
+          unzip -q build-tools.zip
+          rm -f build-tools.zip
+
+          echo "=== 删 ABI 保护 + 去 dirty（对齐实机符号面）==="
+          rm -f common/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+          done
+          echo "源码树与工具链就绪"
+
+      - name: 编译内核生成 Module.symvers
+        run: |
+          cd kernel_workspace/common
+          export PATH="$(pwd)/../clang18/bin:$PATH"
+          export PATH="$(pwd)/../build-tools/bin:$PATH"
+          # 释放 runner 空间（编内核需 ~30GB）
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL &
+
+          echo "=== gki_defconfig ==="
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld O=out KCFLAGS+=-Wno-error gki_defconfig || { echo "defconfig 失败"; exit 1; }
+
+          echo "=== 编 vmlinux + 模块，生成 out/Module.symvers ==="
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang LD=ld.lld O=out KCFLAGS+=-Wno-error modules || { echo "内核 modules 失败"; exit 1; }
+
+          echo "=== Module.symvers 检查 ==="
+          ls -lh out/Module.symvers
+          echo "符号行数：$(wc -l < out/Module.symvers)"
+          echo "=== frame_sync 依赖符号 CRC 抽查 ==="
+          for sym in find_get_pid get_pid_task get_task_mm mmput copy_to_user pfn_valid; do
+            printf "%-16s : " "$sym"
+            grep -m1 -E "\b${sym}\b" out/Module.symvers || echo "未导出(undefined)"
+          done
+
+      - name: 编译 frame_sync.ko
+        run: |
+          COMMON_DIR="$(pwd)/kernel_workspace/common"
+          export PATH="$COMMON_DIR/../clang18/bin:$PATH"
+          export PATH="$COMMON_DIR/../build-tools/bin:$PATH"
+
+          # 源码复制到临时目录编译，避免污染仓库 checkout 目录
+          rm -rf /tmp/frame_sync
+          cp -r "$GITHUB_WORKSPACE/frame_sync" /tmp/frame_sync
+          echo "=== frame_sync 源码 ==="
+          ls -la /tmp/frame_sync
+
+          echo "=== 编 .ko（读 out/Module.symvers 做符号 CRC 解析）==="
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld \
+            -C "$COMMON_DIR" O=out M=/tmp/frame_sync modules 2>&1 | tail -60
+
+          if [ ! -f /tmp/frame_sync/oplus_frame_sync.ko ]; then
+            echo "!!! oplus_frame_sync.ko 编译失败"; exit 1;
+          fi
+
+          echo "=== 编译成功 ==="
+          ls -lh /tmp/frame_sync/oplus_frame_sync.ko
+          echo "=== modinfo ==="
+          modinfo /tmp/frame_sync/oplus_frame_sync.ko 2>/dev/null || true
+          echo "=== vermagic ==="
+          strings /tmp/frame_sync/oplus_frame_sync.ko | grep -E '^vermagic=' || true
+
+          mkdir -p "$GITHUB_WORKSPACE/image_output"
+          cp /tmp/frame_sync/oplus_frame_sync.ko "$GITHUB_WORKSPACE/image_output/oplus_frame_sync.ko"
+          cp "$COMMON_DIR/out/Module.symvers" "$GITHUB_WORKSPACE/image_output/Module.symvers"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: frame_sync-ko
+          path: |
+            ${{ github.workspace }}/image_output/oplus_frame_sync.ko
+            ${{ github.workspace }}/image_output/Module.symvers
