@@ -12,9 +12,7 @@
 # 实测核对（工单 #2）。本 Makefile 不写死任何厂商路径，靠 KDIR 注入。
 
 obj-m += oplus_frame_sync.o
-
-# 后续工单若拆多文件（通道 / 采样 / 自隐藏），改成：
-#   oplus_frame_sync-y := core.o channel.o sampler.o hide.o
+oplus_frame_sync-objs := oplus_frame_sync_core.o oplus_frame_sync_shm.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
