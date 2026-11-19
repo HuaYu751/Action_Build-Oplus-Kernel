@@ -338,6 +338,12 @@ jobs:
               # 修复2（Run 44511765794 实证）：补丁删除了 ksu_late_loaded 声明与 ksu_app_profile_init 定义，但 init.c 残留引用→编译失败
               sed -i '/ksu_late_loaded = (current->pid != 1);/d; /ksu_late_loaded = false;/d; /ksu_app_profile_init();/d' kernel/core/init.c
               sed -i 's/if (ksu_late_loaded) {/if (0) {/; s/if (!ksu_late_loaded) {/if (1) {/' kernel/core/init.c
+              # 修复3（Run 44514753542 实证）：ksud_integration.c 函数签名替换 hunk 失败（上下文漂移超出 fuzz），
+              # 用仓库内确定性脚本手工替换（新签名与 ksud.h 声明、sucompat.c 调用一致）
+              wget -q https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/fix_ksud_integration.py -O /tmp/fix_ksud.py
+              python3 /tmp/fix_ksud.py kernel/runtime/ksud_integration.c || { echo "[FATAL] ksud_integration 函数替换失败"; exit 1; }
+              grep -q "int ksu_handle_execveat_ksud(int \*fd" kernel/runtime/ksud_integration.c || { echo "[FATAL] 新签名缺失"; exit 1; }
+              if grep -q "ksu_stop_ksud_execve_hook\|void ksu_handle_execveat_ksud" kernel/runtime/ksud_integration.c; then echo "[FATAL] 旧签名/旧调用残留"; exit 1; fi
               find . -name "*.orig" -delete 2>/dev/null || true
               find . -name "*.rej" -delete 2>/dev/null || true
               # 校验1：悬空引用必须清零
