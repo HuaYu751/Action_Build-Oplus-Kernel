@@ -265,10 +265,13 @@ jobs:
             grep -q "kernelsu" Makefile || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> Makefile
             grep -q "drivers/kernelsu/Kconfig" Kconfig || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" Kconfig
             cd ../../KernelSU
-            KSU_VERSION=$(expr $(git rev-list --count main) + 30996 2>/dev/null || echo 35000)
+            # 版本号按 v3.0.0 tag Kbuild 常数计算（30000+count-4001=30007，与管理器35000配对无降级）
+            KSU_BASE=$(grep -m1 'VERSION_BASE' kernel/Kbuild | awk '{print $3}')
+            KSU_OFF=$(grep -m1 'VERSION_OFFSET' kernel/Kbuild | awk '{print $3}')
+            KSU_VERSION=$(expr $(git rev-list --count main) + $KSU_BASE - $KSU_OFF 2>/dev/null || echo 30007)
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
-            echo "SukiSU Nova: $(git describe --tags 2>/dev/null) @ $(git rev-parse --short=8 HEAD)"
+            echo "SukiSU Nova: $(git describe --tags 2>/dev/null) @ $(git rev-parse --short=8 HEAD) -> KSU_VERSION=$KSU_VERSION"
           elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             echo "正在配置BakaSU..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
@@ -330,12 +333,15 @@ jobs:
             cd ./KernelSU
             patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch || true
             if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
-              # 已知失败hunk修复（本地实证）：Kbuild删除了hook对象但init.c残留5处调用→链接失败
+              # 修复1：Kbuild删除了hook对象但init.c残留5处调用→链接失败
               sed -i '/ksu_syscall_hook_init();/d; /ksu_lsm_hook_init();/d; /ksu_syscall_hook_manager_init();/d; /ksu_syscall_hook_manager_exit();/d' kernel/core/init.c
+              # 修复2（Run 44511765794 实证）：补丁删除了 ksu_late_loaded 声明与 ksu_app_profile_init 定义，但 init.c 残留引用→编译失败
+              sed -i '/ksu_late_loaded = (current->pid != 1);/d; /ksu_late_loaded = false;/d; /ksu_app_profile_init();/d' kernel/core/init.c
+              sed -i 's/if (ksu_late_loaded) {/if (0) {/; s/if (!ksu_late_loaded) {/if (1) {/' kernel/core/init.c
               find . -name "*.orig" -delete 2>/dev/null || true
               find . -name "*.rej" -delete 2>/dev/null || true
               # 校验1：悬空引用必须清零
-              if grep -rn "ksu_syscall_hook_init\|ksu_lsm_hook_init\|ksu_syscall_hook_manager_init\|ksu_syscall_hook_manager_exit" kernel/ --include="*.c" | grep -v "^kernel/hook/"; then
+              if grep -rn "ksu_syscall_hook_init\|ksu_lsm_hook_init\|ksu_syscall_hook_manager_init\|ksu_syscall_hook_manager_exit\|ksu_late_loaded\|ksu_app_profile_init" kernel/ --include="*.c" --include="*.h" | grep -v "^kernel/hook/"; then
                 echo "[FATAL] init.c 悬空引用清理失败"
                 exit 1
               fi
