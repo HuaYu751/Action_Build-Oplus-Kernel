@@ -12,7 +12,7 @@
 # 实测核对（工单 #2）。本 Makefile 不写死任何厂商路径，靠 KDIR 注入。
 
 obj-m += oplus_frame_sync.o
-oplus_frame_sync-objs := oplus_frame_sync_core.o oplus_frame_sync_shm.o oplus_frame_sync_trigger.o oplus_frame_sync_hook.o
+oplus_frame_sync-objs := oplus_frame_sync_core.o oplus_frame_sync_shm.o oplus_frame_sync_trigger.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
