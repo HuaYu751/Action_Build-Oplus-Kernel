@@ -767,7 +767,7 @@ jobs:
           git clone --depth=1 https://github.com/SukiSU-Nova/SukiSU_KernelPatch_patch.git kpatch
           cd kpatch/kernel
           export ANDROID=1
-          make hdr kpimg
+          make
           test -f ./kpimg || { echo "[FATAL] kpimg 编译失败"; exit 1; }
           KPIMG_SRC="${WORKDIR}/kpatch/kernel/kpimg"
           ls -la "${KPIMG_SRC}"
