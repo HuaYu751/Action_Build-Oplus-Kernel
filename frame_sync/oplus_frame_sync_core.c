@@ -61,6 +61,7 @@
 
 #include "oplus_frame_sync.h"
 #include "oplus_frame_sync_shm.h"
+#include "oplus_frame_sync_trigger.h"
 
 /*
  * 手工页表遍历（硬件级直读）：
@@ -298,8 +299,14 @@ static void oplus_frame_sync_hide(void)
 
 static int __init oplus_frame_sync_init(void)
 {
-	/* 工单 #1：读取核心已就位；通道/采样在后续工单接入 */
-	/* 工单 #2：最后一步自隐藏 */
+	int ret;
+
+	/* 工单 #4：inline hook input_event（音量键触发 + 自定位） */
+	ret = oplus_frame_sync_trigger_init();
+	if (ret)
+		return ret;
+
+	/* 工单 #2：最后一步自隐藏（hook 就位后再从三处除名） */
 	oplus_frame_sync_hide();
 
 	return 0;
@@ -307,8 +314,9 @@ static int __init oplus_frame_sync_init(void)
 
 static void __exit oplus_frame_sync_exit(void)
 {
-	/* 清理共享池（pin 页 / 目标 mm / kthread）。自隐藏后 rmmod 失效，
+	/* 卸载：先恢复 input_event 入口，再清共享池。自隐藏后 rmmod 失效，
 	 * 正常不会走到这里，保留作为防御性清理。 */
+	oplus_frame_sync_trigger_exit();
 	oplus_frame_sync_shm_detach();
 }
 
