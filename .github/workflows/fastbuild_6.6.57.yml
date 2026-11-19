@@ -751,20 +751,43 @@ jobs:
           rm -f Image
           mv oImage Image
 
-      - name: 注入 SukiSU KPM supercall 端点
+      - name: 注入 SukiSU KPM supercall 端点（main 分支编译 kpimg）
         if: inputs.ksu_type == 'sukisu'
         run: |
-          echo "正在为 SukiSU Nova 注入 KPM supercall 端点（SukiSU_KernelPatch_patch 0.11-beta）..."
-          echo "原理：CONFIG_KPM=y 只编客户端桥，管理器探测需要的 SUKISU magic 拦截端点由 kpimg 二进制注入 Image"
+          set -e
+          echo "正在编译 SukiSU KernelPatch kpimg（main 分支，含 Nova ABI v2 truncate supercall）..."
+          echo "原理：CONFIG_KPM=y 只编客户端桥，管理器探测所需的 SUKISU magic 拦截端点由 kpimg 注入 Image"
+          echo "注意：0.11-beta 发行版 kpimg 是旧 SukiSU Ultra 直接符号 hook 机制，与 Nova v3.0.0 不兼容，必须从 main 分支编译"
+          WORKDIR="$(pwd)"
+          # 1. 下载 ARM 裸机交叉编译器（fork 官方 build.yml 同款）
+          curl -o arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -Jxf arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          export TARGET_COMPILE="${WORKDIR}/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+          # 2. 克隆 SukiSU KernelPatch fork main 分支并编译 kpimg（ANDROID 变体，含 su 支持）
+          git clone --depth=1 https://github.com/SukiSU-Nova/SukiSU_KernelPatch_patch.git kpatch
+          cd kpatch/kernel
+          export ANDROID=1
+          make hdr kpimg
+          test -f ./kpimg || { echo "[FATAL] kpimg 编译失败"; exit 1; }
+          KPIMG_SRC="${WORKDIR}/kpatch/kernel/kpimg"
+          ls -la "${KPIMG_SRC}"
+          # 3. 编译 kptools（host 变体，官方 CMake 流程）
+          sudo apt-get install -y zlib1g-dev >/dev/null 2>&1 || true
+          cd "${WORKDIR}/kpatch/tools"
+          mkdir -p build && cd build
+          cmake .. >/dev/null
+          make
+          test -f ./kptools || { echo "[FATAL] kptools 编译失败"; exit 1; }
+          KPTOOLS_SRC="${WORKDIR}/kpatch/tools/build/kptools"
+          cd "${WORKDIR}"
+          # 4. 用 main 分支编译的 kpimg + kptools 注入 Image
           cd kernel_workspace/common/out/arch/arm64/boot
-          wget -q https://github.com/SukiSU-Nova/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux -O kptools-linux
-          wget -q https://github.com/SukiSU-Nova/SukiSU_KernelPatch_patch/releases/download/0.11-beta/kpimg -O kpimg-linux
-          chmod +x ./kptools-linux
-          ./kptools-linux -p -i ./Image -k ./kpimg-linux -o ./oImage
+          chmod +x "${KPTOOLS_SRC}"
+          "${KPTOOLS_SRC}" -p -i ./Image -k "${KPIMG_SRC}" -o ./oImage
           test -f ./oImage || { echo "[FATAL] kpimg 修补未产出 oImage"; exit 1; }
           rm -f Image
           mv oImage Image
-          echo "[OK] KPM supercall 端点注入完成"
+          echo "[OK] KPM supercall 端点注入完成（main 分支编译 kpimg）"
 
       - name: 克隆 AnyKernel3 并打包
         id: create_zip
