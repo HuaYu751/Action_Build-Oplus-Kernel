@@ -17,6 +17,7 @@
 #include <linux/types.h>
 #else
 #include <stdint.h>
+#include <stddef.h>   /* offsetof：OPLUS_FRAME_SYNC_MAGIC_OFF 两端共用 */
 /* 用户态优先用系统 linux/types.h（NDK sysroot 自带，__u64=unsigned long long）；
  * 无该头的环境再兜底补齐，类型写法与内核保持一致避免重定义冲突 */
 #if defined(__has_include)
@@ -36,11 +37,18 @@ typedef signed long long    __s64;
 #endif
 #endif
 
-#define OPLUS_FRAME_SYNC_ABI_VERSION  0x00030002u
+#define OPLUS_FRAME_SYNC_ABI_VERSION  0x00030003u
 #define OPLUS_FRAME_SYNC_BUF_ID        1u      /* 缓冲标识：attach 后内核写入，用户态据此判绑定 */
 
-/* 256KB 映射；实际使用不足 16KB，预留余量给后续字段扩展 */
-#define OPLUS_FRAME_SYNC_MAP_SIZE     (256u * 1024u)
+/* 258048 = 252KB（63 页）：奇尺寸避开 bionic/Scudo 恰好 256KB 的匿名分配撞车
+ *（2026-11-21 实机误绑根因，见 工单_共享池误绑修复_v1.md D1）。
+ * 注意必须是页倍数：263168 非页对齐，mmap 后 VMA 被取整导致尺寸匹配失效。 */
+#define OPLUS_FRAME_SYNC_MAP_SIZE     (258048u)
+
+/* 池归属魔数（D2 双因子）：用户态 mmap 后即写入 _rsv_future 起始（8 字节对齐），
+ * 内核扫描尺寸匹配后再校验魔数，防止再次误绑同尺寸匿名分配。
+ * 常量 0x31535846474C504F 的小端内存字节 = ASCII "OPLGFXS1"。 */
+#define OPLUS_FRAME_SYNC_POOL_MAGIC   0x31535846474C504FULL
 
 #define OPLUS_FRAME_SYNC_ENTITY_MAX   64
 #define OPLUS_FRAME_SYNC_FIELD_MAX    16
@@ -53,6 +61,7 @@ typedef signed long long    __s64;
 #define OPLUS_FRAME_SYNC_STAGE_IDLE    0
 #define OPLUS_FRAME_SYNC_STAGE_RUNNING 1
 #define OPLUS_FRAME_SYNC_STAGE_PAUSED  2
+#define OPLUS_FRAME_SYNC_STAGE_STANDBY 3   /* 待命：已绑定、已释放游戏 mm，等音量- 唤醒或前端重发 START */
 
 /* 命令码（命令池 cmd 字段；稳态控制全走这里，零 ioctl） */
 #define OPLUS_FRAME_SYNC_CMD_START         0x01   /* p0 = 目标 pid */
@@ -125,7 +134,8 @@ struct oplus_frame_sync_hdr {
 	__s32 _pad0;        /* 8 字节对齐 */
 	__s64 stamp;        /* 时间戳（纳秒，app 每轮写，内核据此判断存活） */
 	__s32 frame_num;    /* 采样帧计数（内核每采样一次 +1，用户态据此测算实际采样率） */
-	__s32 _pad[5];      /* 补齐 64B */
+	__s64 k_stamp;      /* 内核存活心跳（纳秒，内核每 tick 写，用户态据此判断内核在线） */
+	__s32 _pad[3];      /* 补齐 64B */
 };
 
 struct oplus_frame_sync_cmd {
@@ -323,5 +333,9 @@ struct oplus_frame_sync_zone {
 
 	__u32 _tail[32];
 };
+
+/* 魔数在池内的偏移（struct 定义之后才能 offsetof，两端同一头文件自动一致） */
+#define OPLUS_FRAME_SYNC_MAGIC_OFF \
+	((unsigned int)offsetof(struct oplus_frame_sync_zone, _rsv_future))
 
 #endif /* _OPLUS_FRAME_SYNC_UAPI_H */
