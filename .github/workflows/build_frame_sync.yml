@@ -100,6 +100,16 @@ jobs:
           echo "=== frame_sync 源码 ==="
           ls -la /tmp/frame_sync
 
+          echo "=== 工单#6：加长 UTS_RELEASE 预留 vermagic 空间 ==="
+          UTS_H="$COMMON_DIR/out/include/generated/utsrelease.h"
+          if [ -f "$UTS_H" ]; then
+            sed -i 's/^#define UTS_RELEASE .*/#define UTS_RELEASE "6.6.57-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"/' "$UTS_H"
+            cat "$UTS_H"
+          else
+            echo "未找到 $UTS_H，搜索："
+            find "$COMMON_DIR/out" -name utsrelease.h 2>/dev/null
+          fi
+
           echo "=== 编 .ko（读 out/Module.symvers 做符号 CRC 解析）==="
           make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC=clang LD=ld.lld \
             -C "$COMMON_DIR" O=out M=/tmp/frame_sync modules 2>&1 | tail -60
