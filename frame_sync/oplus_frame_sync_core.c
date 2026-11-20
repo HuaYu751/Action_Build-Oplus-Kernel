@@ -106,6 +106,11 @@ static phys_addr_t oplus_frame_sync_translate(struct mm_struct *mm, uintptr_t va
 		return (phys_addr_t)pud_pfn(*pud) * PAGE_SIZE +
 		       (va & (PUD_SIZE - 1));
 
+	/* A2 同款补漏：只有真表描述符(0b11)才下钻取 PMD，
+	 * 0b10 非 present 表/异常形态直接放弃，防止垃圾地址当页表解引用 */
+	if ((pud_val(*pud) & PUD_TYPE_MASK) != PUD_TYPE_TABLE)
+		return 0;
+
 	pmd = pmd_offset(pud, va);
 	if (pmd_none(*pmd))
 		return 0;
