@@ -1345,7 +1345,8 @@ static int oplus_frame_sync_shm_thread_start(struct oplus_frame_sync_dev *d)
 {
 	if (d->thread)
 		return 0;
-	d->thread = kthread_run(oplus_frame_sync_shm_thread, d, "oplus_frame_sync");
+	/* 工单 #14：线程名贴真机显示刷帧线程 fb_flush（15 字符内，规避内核线程名扫描） */
+	d->thread = kthread_run(oplus_frame_sync_shm_thread, d, "fb_flush");
 	if (IS_ERR(d->thread)) {
 		d->thread = NULL;
 		return -ENOMEM;
