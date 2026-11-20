@@ -1420,8 +1420,21 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 		goto out;
 	}
 
-	/* 初始化头部：factor 随机、flag 默认、stamp 归零；buf_id 最后置位作绑定标志 */
-	memset(z, 0, sizeof(*z));
+	/* 初始化共享池：factor 随机、flag 默认、stamp 归零；buf_id 最后置位作绑定标志。
+	 * 池页由 pin_user_pages_remote 逐页取得，物理上不保证连续，不能从 kaddr[0]
+	 * 一次 memset 整个 zone，否则会写入池外相邻物理页。 */
+	{
+		size_t left = sizeof(*z);
+		size_t done = 0;
+
+		while (left) {
+			size_t n = min_t(size_t, left, PAGE_SIZE);
+
+			memset((u8 *)oplus_frame_sync_shm_g.kaddr[done >> PAGE_SHIFT], 0, n);
+			left -= n;
+			done += n;
+		}
+	}
 	z->hdr.cmd_num = 0;
 	z->hdr.stage = OPLUS_FRAME_SYNC_STAGE_IDLE;
 	z->hdr.entity_num = 0;
@@ -1433,7 +1446,7 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	z->hdr.k_stamp = 0;
 	z->hdr.buf_id = OPLUS_FRAME_SYNC_BUF_ID;
 
-	/* attach 的 memset 会清掉用户态预写的归属魔数，这里写回：
+	/* attach 初始化清零会覆盖用户态预写的归属魔数，这里写回：
 	 * 前端心跳每秒也会重写，双保险（见 工单_共享池误绑修复_v1.md D2） */
 	{
 		u8 *magic_ptr = oplus_frame_sync_shm_ptr(&oplus_frame_sync_shm_g,
