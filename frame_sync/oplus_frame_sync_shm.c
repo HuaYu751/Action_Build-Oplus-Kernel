@@ -27,6 +27,8 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
+#include <linux/hrtimer.h>
+#include <linux/timekeeping.h>
 #include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/string.h>
@@ -329,8 +331,14 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 	case OPLUS_FRAME_SYNC_CMD_SET_RATE:
 		if (c->p0 < 0 || c->p0 > (s32)OPLUS_FRAME_SYNC_RATE_MAX)
 			ret = -EINVAL;
-		else
+		else {
 			d->rate = (u32)c->p0;
+			/* 0=关：运行中切暂停；>0 从暂停恢复 */
+			if (!d->rate && d->stage == OPLUS_FRAME_SYNC_STAGE_RUNNING)
+				d->stage = OPLUS_FRAME_SYNC_STAGE_PAUSED;
+			else if (d->rate && d->stage == OPLUS_FRAME_SYNC_STAGE_PAUSED)
+				d->stage = OPLUS_FRAME_SYNC_STAGE_RUNNING;
+		}
 		break;
 
 	case OPLUS_FRAME_SYNC_CMD_SET_PARAMS:
@@ -717,12 +725,41 @@ static void oplus_frame_sync_shm_sample(struct oplus_frame_sync_dev *d,
 /* ------------------------------------------------------------------ *
  * kthread
  * ------------------------------------------------------------------ */
+static void oplus_frame_sync_shm_sleep_cycle(ktime_t *cycle, u32 rate)
+{
+	u64 period_ns;
+	ktime_t now, rel;
+
+	if (!rate)
+		rate = OPLUS_FRAME_SYNC_RATE_DEFAULT;
+
+	/* 采样周期（纳秒）：1e9 / rate，最低 1us 防异常 */
+	period_ns = 1000000000ULL / rate;
+	if (period_ns < 1000ULL)
+		period_ns = 1000ULL;
+
+	/* 周期对齐：下一周期边界 = 上一周期 + 周期长 */
+	*cycle = ktime_add_ns(*cycle, period_ns);
+	now = ktime_get();
+
+	if (ktime_after(now, *cycle)) {
+		/* 采样耗时已超一个周期：不睡，重排到当前，下轮再对齐 */
+		*cycle = now;
+		return;
+	}
+
+	/* 高精度睡到下一周期边界（允许 ±5% 抖动，省电合并唤醒） */
+	rel = ktime_sub(*cycle, now);
+	schedule_hrtimeout_range(&rel, period_ns / 20, HRTIMER_MODE_REL);
+}
+
 static int oplus_frame_sync_shm_thread(void *arg)
 {
 	struct oplus_frame_sync_dev *d = arg;
+	ktime_t cycle = ktime_get();
 
 	while (!kthread_should_stop()) {
-		u32 interval;
+		u32 rate;
 
 		mutex_lock(&oplus_frame_sync_shm_lock);
 
@@ -755,12 +792,10 @@ static int oplus_frame_sync_shm_thread(void *arg)
 			}
 		}
 
-		interval = 1000 / (d->rate ? d->rate : OPLUS_FRAME_SYNC_RATE_DEFAULT);
-		if (interval < 4)
-			interval = 4;
-
+		rate = d->rate;
 		mutex_unlock(&oplus_frame_sync_shm_lock);
-		msleep_interruptible(interval);
+
+		oplus_frame_sync_shm_sleep_cycle(&cycle, rate);
 	}
 
 	return 0;
