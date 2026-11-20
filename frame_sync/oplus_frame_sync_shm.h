@@ -24,4 +24,13 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size);
  */
 void oplus_frame_sync_shm_detach(void);
 
+/* 是否已绑定共享池（音量键状态感知用） */
+bool oplus_frame_sync_shm_bound(void);
+
+/*
+ * 音量- 唤醒：仅 已绑定 + STANDBY + 记忆的游戏进程存活 时恢复 RUNNING；
+ * 运行/暂停/未绑定调用均安全忽略。0=已唤醒，负值=未唤醒（保持待命）。
+ */
+int oplus_frame_sync_shm_wake(void);
+
 #endif /* _OPLUS_FRAME_SYNC_SHM_H */
