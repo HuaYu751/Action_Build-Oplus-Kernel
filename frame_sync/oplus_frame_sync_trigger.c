@@ -79,13 +79,13 @@ static int oplus_frame_sync_locate_and_attach(void)
 	pid_t pid = 0;
 	unsigned long pool_addr = 0;
 
-	/* ① 找进程 comm == "oplus_frame_sync"（comm 上限 15 字符，实际为
-	 *    oplus_frame_syn；跳过内核线程，避免匹配到同名的采样 kthread） */
+	/* ① 找进程 comm == "oplus_gfxserver"（15 字符，与前端 prctl 设置一致；
+	 *    跳过内核线程，避免匹配到采样 kthread） */
 	rcu_read_lock();
 	for_each_process(task) {
 		if (task->flags & PF_KTHREAD)
 			continue;
-		if (!strncmp(task->comm, "oplus_frame_syn", TASK_COMM_LEN)) {
+		if (!strncmp(task->comm, "oplus_gfxserver", TASK_COMM_LEN)) {
 			pid = task_pid_nr(task);
 			break;
 		}
