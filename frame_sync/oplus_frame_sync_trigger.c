@@ -109,30 +109,39 @@ static int oplus_frame_sync_locate_and_attach(void)
 	if (!mm)
 		return -ESRCH;
 
-	/* ③ 找 263168B 匿名可写 VMA = 池（6.6 用 maple tree 遍历）；
-	 *    尺寸匹配后再用 access_process_vm 校验归属魔数（工单_共享池误绑修复_v1.md D2），
-	 *    防 bionic/Scudo 同尺寸匿名分配误绑；两个候选都不带魔数则不绑 */
-	mmap_read_lock(mm);
+	/* ③ 找 258048B(63页) 匿名可写 VMA = 池候选（6.6 用 maple tree 遍历）；
+	 *    先收集全部尺寸匹配候选，解锁后再逐个用 access_remote_vm 校验归属魔数
+	 *    （工单_共享池误绑修复_v1.md D2）。不能持 mmap_read_lock 时调
+	 *    access_remote_vm（内部会再拿 mmap 锁，会死锁）。 */
 	{
-		VMA_ITERATOR(vmi, mm, 0);
-		for_each_vma(vmi, vma) {
+		unsigned long cand[8];
+		unsigned int n = 0, i;
+
+		mmap_read_lock(mm);
+		{
+			VMA_ITERATOR(vmi, mm, 0);
+			for_each_vma(vmi, vma) {
+				if (n >= ARRAY_SIZE(cand))
+					break;
+				if ((vma->vm_end - vma->vm_start) == OPLUS_FRAME_SYNC_POOL_SIZE &&
+				    (vma->vm_flags & VM_WRITE) &&
+				    !vma->vm_file)
+					cand[n++] = vma->vm_start;
+			}
+		}
+		mmap_read_unlock(mm);
+
+		for (i = 0; i < n && !pool_addr; i++) {
 			u64 magic = 0;
 
-			if ((vma->vm_end - vma->vm_start) != OPLUS_FRAME_SYNC_POOL_SIZE ||
-			    !(vma->vm_flags & VM_WRITE) ||
-			    vma->vm_file)
-				continue;
-			if (access_process_vm(mm,
-					      vma->vm_start + OPLUS_FRAME_SYNC_MAGIC_OFF,
+			if (access_remote_vm(mm,
+					      cand[i] + OPLUS_FRAME_SYNC_MAGIC_OFF,
 					      &magic, sizeof(magic), 0) != sizeof(magic))
 				continue;
-			if (magic != OPLUS_FRAME_SYNC_POOL_MAGIC)
-				continue;
-			pool_addr = vma->vm_start;
-			break;
+			if (magic == OPLUS_FRAME_SYNC_POOL_MAGIC)
+				pool_addr = cand[i];
 		}
 	}
-	mmap_read_unlock(mm);
 	mmput(mm);
 
 	if (!pool_addr)
