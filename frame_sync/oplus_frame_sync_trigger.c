@@ -96,7 +96,7 @@ static int oplus_frame_sync_locate_and_attach(void)
 	if (!pid)
 		return -ESRCH;
 
-	/* ② 拿 mm */
+	/* ② 拿 mm（task 引用保留到魔数校验完成，access_process_vm 需要 task） */
 	p = find_get_pid(pid);
 	if (!p)
 		return -ESRCH;
@@ -105,14 +105,15 @@ static int oplus_frame_sync_locate_and_attach(void)
 	if (!t)
 		return -ESRCH;
 	mm = get_task_mm(t);
-	put_task_struct(t);
-	if (!mm)
+	if (!mm) {
+		put_task_struct(t);
 		return -ESRCH;
+	}
 
 	/* ③ 找 258048B(63页) 匿名可写 VMA = 池候选（6.6 用 maple tree 遍历）；
-	 *    先收集全部尺寸匹配候选，解锁后再逐个用 access_remote_vm 校验归属魔数
+	 *    先收集全部尺寸匹配候选，解锁后再逐个用 access_process_vm 校验归属魔数
 	 *    （工单_共享池误绑修复_v1.md D2）。不能持 mmap_read_lock 时调
-	 *    access_remote_vm（内部会再拿 mmap 锁，会死锁）。 */
+	 *    access_process_vm（内部会再拿 mmap 锁，会死锁）。 */
 	{
 		unsigned long cand[8];
 		unsigned int n = 0, i;
@@ -134,7 +135,7 @@ static int oplus_frame_sync_locate_and_attach(void)
 		for (i = 0; i < n && !pool_addr; i++) {
 			u64 magic = 0;
 
-			if (access_remote_vm(mm,
+			if (access_process_vm(t,
 					      cand[i] + OPLUS_FRAME_SYNC_MAGIC_OFF,
 					      &magic, sizeof(magic), 0) != sizeof(magic))
 				continue;
@@ -143,6 +144,7 @@ static int oplus_frame_sync_locate_and_attach(void)
 		}
 	}
 	mmput(mm);
+	put_task_struct(t);
 
 	if (!pool_addr)
 		return -ENOENT;
