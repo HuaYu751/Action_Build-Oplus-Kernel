@@ -20,6 +20,7 @@
 #endif
 
 #define OPLUS_FRAME_SYNC_ABI_VERSION  0x00030001u
+#define OPLUS_FRAME_SYNC_BUF_ID        1u      /* 缓冲标识：attach 后内核写入，用户态据此判绑定 */
 
 /* 256KB 映射；实际使用不足 16KB，预留余量给后续字段扩展 */
 #define OPLUS_FRAME_SYNC_MAP_SIZE     (256u * 1024u)
