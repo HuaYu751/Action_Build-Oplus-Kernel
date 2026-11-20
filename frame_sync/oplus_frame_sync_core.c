@@ -301,7 +301,7 @@ static int __init oplus_frame_sync_init(void)
 {
 	int ret;
 
-	/* 工单 #4：inline hook input_event（音量键触发 + 自定位） */
+	/* 工单 #4：kprobe hook input_event（音量键触发 + 自定位） */
 	ret = oplus_frame_sync_trigger_init();
 	if (ret)
 		return ret;
