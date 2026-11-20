@@ -942,6 +942,19 @@ static inline bool oplus_frame_sync_f32_pos_le(u32 bits, u32 le_bits)
 	return bits <= le_bits;
 }
 
+/* |float| <= limit，按位型比较，不触发 FPU */
+static inline bool oplus_frame_sync_f32_abs_le(u32 bits, u32 limit_bits)
+{
+	bits &= 0x7FFFFFFFu;
+	if (!oplus_frame_sync_f32_isfinite(bits))
+		return false;
+	return bits <= limit_bits;
+}
+
+#define OPLUS_FRAME_SYNC_XY_LIMIT_BITS   0x469C4000u /* 20000.0 */
+#define OPLUS_FRAME_SYNC_Z_NEG_LIMIT_BITS 0x44FA0000u /* 2000.0 */
+#define OPLUS_FRAME_SYNC_Z_POS_LIMIT_BITS 0x459C4000u /* 5000.0 */
+
 /* 名字读取：ps → FString（主用，失败走兜底），原始 UTF-16LE 写 name 区（单缓冲） */
 static void oplus_frame_sync_shm_name_fill(struct oplus_frame_sync_dev *d,
 					   u32 idx, u64 ps)
@@ -1083,6 +1096,12 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 
 			if (!act || act == pawn)
 				continue;
+			/* 只保留玩家角色（FName 在 1.25.0 全部实例一致）；
+			 * 过滤 Level 里的 PlayerState/技能组件/场景机关等非玩家 actor。 */
+			if (cfg->player_nid && cfg->obj_name_off &&
+			    (u32)oplus_frame_sync_shm_rd32(d->tg_mm,
+					act + cfg->obj_name_off) != cfg->player_nid)
+				continue;
 			e1 = oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->e1_off);
 			if (!e1)
 				continue;
@@ -1128,9 +1147,25 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 			if (oplus_frame_sync_read_kbuf(d->tg_mm, root + cfg->pos_off,
 						       pos, sizeof(pos)) <= 0)
 				continue;
-			if (!oplus_frame_sync_f32_isfinite(pos[0]) ||
-			    !oplus_frame_sync_f32_isfinite(pos[1]))
+			/* 坐标合法性：拒绝未激活角色的 (0,0,-90000) 之类幽灵坐标。
+			 * x/y 限 ±20000，z 限 -2000..5000；全部按位型比较，不碰 FPU。 */
+			if (!oplus_frame_sync_f32_abs_le(pos[0],
+					OPLUS_FRAME_SYNC_XY_LIMIT_BITS) ||
+			    !oplus_frame_sync_f32_abs_le(pos[1],
+					OPLUS_FRAME_SYNC_XY_LIMIT_BITS))
 				continue;
+			if ((pos[0] & 0x7FFFFFFFu) == 0 &&
+			    (pos[1] & 0x7FFFFFFFu) == 0)
+				continue;
+			if (!oplus_frame_sync_f32_isfinite(pos[2]))
+				continue;
+			if (pos[2] & 0x80000000u) {
+				if ((pos[2] & 0x7FFFFFFFu) >
+				    OPLUS_FRAME_SYNC_Z_NEG_LIMIT_BITS)
+					continue;
+			} else if (pos[2] > OPLUS_FRAME_SYNC_Z_POS_LIMIT_BITS) {
+				continue;
+			}
 
 			ps = oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->ps_off);
 			if (ps)
