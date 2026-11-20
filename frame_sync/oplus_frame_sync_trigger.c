@@ -27,9 +27,11 @@
 #include <linux/kprobes.h>
 
 #include "oplus_frame_sync_shm.h"
+#include "oplus_frame_sync_uapi.h"
 
 #define OPLUS_FRAME_SYNC_VOL_TIMEOUT_MS  2000u
-#define OPLUS_FRAME_SYNC_POOL_SIZE       (256u * 1024u)
+/* 池尺寸与 ABI 单一来源 uapi.h（258048 = 252KB/63页，避开 256KB 整数尺寸撞车） */
+#define OPLUS_FRAME_SYNC_POOL_SIZE       OPLUS_FRAME_SYNC_MAP_SIZE
 
 /* 长按计时状态 */
 static bool vol_down_pressed;
@@ -107,17 +109,27 @@ static int oplus_frame_sync_locate_and_attach(void)
 	if (!mm)
 		return -ESRCH;
 
-	/* ③ 找 256KB 匿名可写 VMA = 池（6.6 用 maple tree 遍历） */
+	/* ③ 找 263168B 匿名可写 VMA = 池（6.6 用 maple tree 遍历）；
+	 *    尺寸匹配后再用 access_process_vm 校验归属魔数（工单_共享池误绑修复_v1.md D2），
+	 *    防 bionic/Scudo 同尺寸匿名分配误绑；两个候选都不带魔数则不绑 */
 	mmap_read_lock(mm);
 	{
 		VMA_ITERATOR(vmi, mm, 0);
 		for_each_vma(vmi, vma) {
-			if ((vma->vm_end - vma->vm_start) == OPLUS_FRAME_SYNC_POOL_SIZE &&
-			    (vma->vm_flags & VM_WRITE) &&
-			    !vma->vm_file) {
-				pool_addr = vma->vm_start;
-				break;
-			}
+			u64 magic = 0;
+
+			if ((vma->vm_end - vma->vm_start) != OPLUS_FRAME_SYNC_POOL_SIZE ||
+			    !(vma->vm_flags & VM_WRITE) ||
+			    vma->vm_file)
+				continue;
+			if (access_process_vm(mm,
+					      vma->vm_start + OPLUS_FRAME_SYNC_MAGIC_OFF,
+					      &magic, sizeof(magic), 0) != sizeof(magic))
+				continue;
+			if (magic != OPLUS_FRAME_SYNC_POOL_MAGIC)
+				continue;
+			pool_addr = vma->vm_start;
+			break;
 		}
 	}
 	mmap_read_unlock(mm);
@@ -130,12 +142,21 @@ static int oplus_frame_sync_locate_and_attach(void)
 	return oplus_frame_sync_shm_attach(pid, pool_addr, OPLUS_FRAME_SYNC_POOL_SIZE);
 }
 
-/* delayed work：2 秒后检查是否仍在按，触发扫描 */
+/* delayed work：2 秒后检查是否仍在按，按状态分流（用户决策 2026-11-21）：
+ *   未绑定 → 自定位扫描 + attach（原有路径）
+ *   已绑定 + 待命 → 唤醒（重新挂接记忆的游戏进程）
+ *   已绑定 + 运行/暂停 → 忽略（不再重扫重绑，池不被重置）
+ */
 static void oplus_frame_sync_scan_work(struct work_struct *w)
 {
 	if (!vol_down_pressed)
 		return;
 	vol_down_pressed = false;
+
+	if (oplus_frame_sync_shm_bound()) {
+		oplus_frame_sync_shm_wake();
+		return;
+	}
 	oplus_frame_sync_locate_and_attach();
 }
 
