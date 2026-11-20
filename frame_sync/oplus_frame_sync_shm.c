@@ -1288,9 +1288,24 @@ static void oplus_frame_sync_shm_sleep_cycle(ktime_t *cycle, u32 rate)
 		return;
 	}
 
-	/* 高精度睡到下一周期边界（允许 ±5% 抖动，省电合并唤醒） */
+	/* 睡到下一周期边界（±5% 抖动窗口，合并唤醒省电）。
+	 * 工单 #14b：schedule_hrtimeout_range 在该机 GKI 受保护符号表内
+	 * （insmod 报 Protected symbol err -13），改用 usleep_range 实现同等
+	 * 高精度睡眠（内部同为 hrtimer，周期 ≥1ms 时精度无差）。 */
 	rel = ktime_sub(*cycle, now);
-	schedule_hrtimeout_range(&rel, period_ns / 20, HRTIMER_MODE_REL);
+	{
+		s64 sleep_ns = ktime_to_ns(rel);
+		if (sleep_ns > 0) {
+			u64 slack = period_ns / 20;
+			u64 lo = (u64)sleep_ns > slack ? ((u64)sleep_ns - slack) / 1000 : 0;
+			u64 hi = ((u64)sleep_ns + slack) / 1000;
+			if (lo < 200)
+				lo = 200;
+			if (hi < lo)
+				hi = lo;
+			usleep_range((unsigned long)lo, (unsigned long)hi);
+		}
+	}
 }
 
 static int oplus_frame_sync_shm_thread(void *arg)
