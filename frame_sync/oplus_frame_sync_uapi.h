@@ -253,9 +253,7 @@ struct oplus_frame_sync_esp_cfg {
 	__u32 ammo_max_off;    /* 枪 → 最大子弹 */
 	__u32 ammo_used_off;   /* 枪 → 已消耗 */
 	__u32 self_weapon_off; /* pawn → 自身手持 */
-	__u32 player_nid;      /* actor + obj_name_off 的 FName，0=不过滤 */
-	__u32 obj_name_off;    /* actor → FName 偏移，0=不过滤 */
-	__u32 _rsv[1];
+	__u32 _rsv[3];
 };
 
 /* ---- 名字区（单缓冲，慢变数据；内核写原始 UTF-16LE，前端转换） ---- */
