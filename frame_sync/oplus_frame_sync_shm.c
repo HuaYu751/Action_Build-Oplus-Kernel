@@ -64,6 +64,8 @@ struct oplus_frame_sync_dev {
 
 	struct mm_struct *tg_mm;	/* 采样目标（游戏） */
 	pid_t tg_pid;
+	pid_t want_pid;		/* 记忆的游戏进程：STOP 后保留，音量- 唤醒/前端重发 START 用；
+				 * RESET/DETACH/看门狗死亡时清除 */
 
 	u64 base;
 	u64 arr_off;
@@ -371,6 +373,7 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 	case OPLUS_FRAME_SYNC_CMD_START:
 		ret = oplus_frame_sync_shm_target_get(d, c->p0);
 		if (!ret) {
+			d->want_pid = c->p0;
 			if (!d->rate)
 				d->rate = OPLUS_FRAME_SYNC_RATE_DEFAULT;
 			d->stage = OPLUS_FRAME_SYNC_STAGE_RUNNING;
@@ -380,7 +383,10 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 		break;
 
 	case OPLUS_FRAME_SYNC_CMD_STOP:
+		/* 回待命：释放游戏 mm，保留共享池/配置/rate；
+		 * want_pid 刻意保留（音量- 唤醒依据，见 工单_待命唤醒与UI状态_v1.md D1） */
 		oplus_frame_sync_shm_target_put(d);
+		d->stage = OPLUS_FRAME_SYNC_STAGE_STANDBY;
 		break;
 
 	case OPLUS_FRAME_SYNC_CMD_SET_RATE:
@@ -453,6 +459,7 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 
 	case OPLUS_FRAME_SYNC_CMD_DETACH:
 		/* 前端主动断开共享池：kthread 下轮做 target_put + unpin */
+		d->want_pid = 0;
 		d->want_detach = true;
 		break;
 
@@ -473,6 +480,7 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 	}
 
 	case OPLUS_FRAME_SYNC_CMD_RESET:
+		d->want_pid = 0;
 		oplus_frame_sync_shm_target_put(d);
 		oplus_frame_sync_shm_reset_params(d);
 		d->want_detach = true;
@@ -1324,6 +1332,12 @@ static int oplus_frame_sync_shm_thread(void *arg)
 			if (z) {
 				oplus_frame_sync_shm_drain(d, z);
 
+				/* 状态发布：stage 每次变更后经 drain 落到 header；
+				 * k_stamp 每 tick 写（待命/暂停也写）＝内核存活心跳，
+				 * 前端 UI 据此显示 运行中/待命/暂停/失联 */
+				smp_store_release(&z->hdr.stage, (s32)d->stage);
+				smp_store_release(&z->hdr.k_stamp, (s64)ktime_get_ns());
+
 				/* 看门狗：stamp 长时间不更新则停采样 */
 				if (z->hdr.stamp != d->last_stamp) {
 					d->last_stamp = z->hdr.stamp;
@@ -1332,6 +1346,7 @@ static int oplus_frame_sync_shm_thread(void *arg)
 					   time_after(jiffies, d->last_stamp_jiff +
 						      msecs_to_jiffies(OPLUS_FRAME_SYNC_WATCHDOG_MS))) {
 					oplus_frame_sync_shm_target_put(d);
+					d->want_pid = 0;
 					d->want_detach = true;
 				}
 
@@ -1341,6 +1356,7 @@ static int oplus_frame_sync_shm_thread(void *arg)
 
 			if (d->want_detach) {
 				d->want_detach = false;
+				d->want_pid = 0;
 				oplus_frame_sync_shm_target_put(d);
 				oplus_frame_sync_shm_unpin(d);
 				oplus_frame_sync_shm_reset_params(d);
@@ -1414,7 +1430,18 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	z->hdr.flag = OPLUS_FRAME_SYNC_FLAG_ENTITY | OPLUS_FRAME_SYNC_FLAG_CAMERA;
 	z->hdr.stamp = 0;
 	z->hdr.frame_num = 0;
+	z->hdr.k_stamp = 0;
 	z->hdr.buf_id = OPLUS_FRAME_SYNC_BUF_ID;
+
+	/* attach 的 memset 会清掉用户态预写的归属魔数，这里写回：
+	 * 前端心跳每秒也会重写，双保险（见 工单_共享池误绑修复_v1.md D2） */
+	{
+		u8 *magic_ptr = oplus_frame_sync_shm_ptr(&oplus_frame_sync_shm_g,
+							 OPLUS_FRAME_SYNC_MAGIC_OFF,
+							 sizeof(u64));
+		if (magic_ptr)
+			*(u64 *)magic_ptr = OPLUS_FRAME_SYNC_POOL_MAGIC;
+	}
 
 	oplus_frame_sync_shm_reset_params(&oplus_frame_sync_shm_g);
 	oplus_frame_sync_shm_g.rp = 0;
@@ -1422,6 +1449,7 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	oplus_frame_sync_shm_g.errors = 0;
 	oplus_frame_sync_shm_g.rate = OPLUS_FRAME_SYNC_RATE_DEFAULT;
 	oplus_frame_sync_shm_g.stage = OPLUS_FRAME_SYNC_STAGE_IDLE;
+	oplus_frame_sync_shm_g.want_pid = 0;
 	oplus_frame_sync_shm_g.want_detach = false;
 	oplus_frame_sync_shm_g.last_stamp = 0;
 	oplus_frame_sync_shm_g.last_stamp_jiff = jiffies;
@@ -1430,6 +1458,49 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	if (ret) {
 		oplus_frame_sync_shm_unpin(&oplus_frame_sync_shm_g);
 		goto out;
+	}
+
+out:
+	mutex_unlock(&oplus_frame_sync_shm_lock);
+	return ret;
+}
+
+/* 是否已绑定共享池（音量键状态感知用：绑定→唤醒/忽略，未绑定→扫描） */
+bool oplus_frame_sync_shm_bound(void)
+{
+	return oplus_frame_sync_shm_g.kaddr != NULL;
+}
+
+/*
+ * 音量- 唤醒（工单_待命唤醒与UI状态_v1.md D4）：
+ *   已绑定 + STANDBY + want_pid 存活 → 重新挂接游戏进程，恢复 RUNNING
+ *   （rate/偏移配置原样保留）；进程已死 → 保持 STANDBY，等前端重发 START。
+ * 运行/暂停态调用本函数直接忽略（用户决策：运行中长按 = 忽略）。
+ */
+int oplus_frame_sync_shm_wake(void)
+{
+	struct oplus_frame_sync_dev *d = &oplus_frame_sync_shm_g;
+	struct oplus_frame_sync_zone *z;
+	int ret = -EINVAL;
+
+	mutex_lock(&oplus_frame_sync_shm_lock);
+
+	if (!d->kaddr || d->stage != OPLUS_FRAME_SYNC_STAGE_STANDBY || d->want_pid <= 0)
+		goto out;
+
+	ret = oplus_frame_sync_shm_target_get(d, d->want_pid);
+	if (ret)
+		goto out;
+
+	if (!d->rate)
+		d->rate = OPLUS_FRAME_SYNC_RATE_DEFAULT;
+	d->stage = OPLUS_FRAME_SYNC_STAGE_RUNNING;
+
+	z = oplus_frame_sync_shm_zone(d);
+	if (z) {
+		d->last_stamp = z->hdr.stamp;
+		d->last_stamp_jiff = jiffies;
+		smp_store_release(&z->hdr.stage, (s32)d->stage);
 	}
 
 out:
