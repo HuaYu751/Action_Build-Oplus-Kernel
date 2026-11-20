@@ -98,7 +98,8 @@ struct oplus_frame_sync_hdr {
 	__s32 flag;         /* 标志 */
 	__s32 _pad0;        /* 8 字节对齐 */
 	__s64 stamp;        /* 时间戳（纳秒，app 每轮写，内核据此判断存活） */
-	__s32 _pad[6];      /* 补齐 64B */
+	__s32 frame_num;    /* 采样帧计数（内核每采样一次 +1，用户态据此测算实际采样率） */
+	__s32 _pad[5];      /* 补齐 64B */
 };
 
 struct oplus_frame_sync_cmd {
