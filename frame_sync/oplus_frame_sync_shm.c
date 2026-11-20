@@ -717,9 +717,10 @@ static void oplus_frame_sync_shm_sample(struct oplus_frame_sync_dev *d,
 	if (mask & OPLUS_FRAME_SYNC_FLAG_MBOX)
 		oplus_frame_sync_shm_service_mbox(d, buf);
 
-	/* 原子翻页：数据写完再 release 发布索引 */
+	/* 原子翻页：数据写完再 release 发布索引；frame_num 同步发布帧计数 */
 	smp_store_release(&z->hdr.buf_idx, buf);
 	d->frames++;
+	smp_store_release(&z->hdr.frame_num, d->frames);
 }
 
 /* ------------------------------------------------------------------ *
@@ -848,9 +849,8 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 		goto out;
 	}
 
-	/* 初始化头部：buf_id 固定、factor 随机、stamp 归零 */
+	/* 初始化头部：factor 随机、flag 默认、stamp 归零；buf_id 最后置位作绑定标志 */
 	memset(z, 0, sizeof(*z));
-	z->hdr.buf_id = 0;
 	z->hdr.cmd_num = 0;
 	z->hdr.stage = OPLUS_FRAME_SYNC_STAGE_IDLE;
 	z->hdr.entity_num = 0;
@@ -858,6 +858,8 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	z->hdr.factor = get_random_u32();
 	z->hdr.flag = OPLUS_FRAME_SYNC_FLAG_ENTITY | OPLUS_FRAME_SYNC_FLAG_CAMERA;
 	z->hdr.stamp = 0;
+	z->hdr.frame_num = 0;
+	z->hdr.buf_id = OPLUS_FRAME_SYNC_BUF_ID;
 
 	oplus_frame_sync_shm_reset_params(&oplus_frame_sync_shm_g);
 	oplus_frame_sync_shm_g.rp = 0;
