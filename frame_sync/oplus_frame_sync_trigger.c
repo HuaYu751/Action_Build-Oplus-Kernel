@@ -30,7 +30,7 @@
 #include "oplus_frame_sync_uapi.h"
 
 #define OPLUS_FRAME_SYNC_VOL_TIMEOUT_MS  2000u
-/* 池尺寸与 ABI 单一来源 uapi.h（258048 = 252KB/63页，避开 256KB 整数尺寸撞车） */
+/* 池尺寸与 ABI 单一来源 uapi.h（282624 = 276KB/69页，避开 256KB 整数尺寸撞车） */
 #define OPLUS_FRAME_SYNC_POOL_SIZE       OPLUS_FRAME_SYNC_MAP_SIZE
 
 /* 长按计时状态 */
@@ -110,7 +110,7 @@ static int oplus_frame_sync_locate_and_attach(void)
 		return -ESRCH;
 	}
 
-	/* ③ 找 258048B(63页) 匿名可写 VMA = 池候选（6.6 用 maple tree 遍历）；
+	/* ③ 找 282624B(69页) 匿名可写 VMA = 池候选（6.6 用 maple tree 遍历）；
 	 *    先收集全部尺寸匹配候选，解锁后再逐个用 access_process_vm 校验归属魔数
 	 *    （工单_共享池误绑修复_v1.md D2）。不能持 mmap_read_lock 时调
 	 *    access_process_vm（内部会再拿 mmap 锁，会死锁）。 */
