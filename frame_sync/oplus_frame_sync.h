@@ -19,19 +19,6 @@ struct mm_struct;
  */
 
 /*
- * 读/写目标进程物理内存（页表遍历 + phys_to_virt 直读）。
- *   pid      目标进程
- *   addr     目标虚拟地址
- *   buffer   用户态缓冲区
- *   size     字节数
- *   iswrite  false=读 true=写
- * 返回：>0 实际字节数；-EINVAL 参数错；-ESRCH 进程不存在；-EFAULT 失败。
- * 跨页时遇未驻留页即停（返回已成功部分），不触发缺页、不置 AF 位。
- */
-ssize_t oplus_frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
-			  size_t size, bool iswrite);
-
-/*
  * 内核缓冲区直读（供采样循环使用，不经过 copy_to_user）。
  *   mm   目标 mm（调用方持有引用）
  *   addr 目标虚拟地址
