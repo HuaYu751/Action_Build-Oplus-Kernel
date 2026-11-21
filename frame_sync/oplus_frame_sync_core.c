@@ -43,6 +43,7 @@
 #include <asm/memory.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
+#include <asm/processor.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/mm.h>
@@ -153,28 +154,6 @@ static inline int oplus_frame_sync_valid_phys_addr_range(phys_addr_t addr, size_
 #define IS_VALID_PHYS_ADDR_RANGE(x, y) valid_phys_addr_range((x), (y))
 #endif
 
-static size_t oplus_frame_sync_read_phys(phys_addr_t pa, void *buffer, size_t size)
-{
-	if (!pfn_valid(__phys_to_pfn(pa)))
-		return 0;
-	if (!IS_VALID_PHYS_ADDR_RANGE(pa, size))
-		return 0;
-	if (copy_to_user(buffer, phys_to_virt(pa), size))
-		return 0;
-	return size;
-}
-
-static size_t oplus_frame_sync_write_phys(phys_addr_t pa, void *buffer, size_t size)
-{
-	if (!pfn_valid(__phys_to_pfn(pa)))
-		return 0;
-	if (!IS_VALID_PHYS_ADDR_RANGE(pa, size))
-		return 0;
-	if (copy_from_user(phys_to_virt(pa), buffer, size))
-		return 0;
-	return size;
-}
-
 /*
  * 内核缓冲区直读：物理页 -> 内核缓冲区（不经用户态拷贝）。
  * 供采样循环使用：直接 memcpy 到已 pin 的共享页线性映射地址。
@@ -182,23 +161,41 @@ static size_t oplus_frame_sync_write_phys(phys_addr_t pa, void *buffer, size_t s
  * 无锁调用：依赖调用方持有 mm 引用，靠 pfn_valid + 地址范围校验兜底垃圾 phys。
  * B1：未驻留/非法页不中断，memset 置零后翻下一页（偏移对齐不错位），
  *     返回值 = 实际有效字节数，全失败才 -EFAULT。
+ * F1（工单_读取稳定性_v1）：无锁遍历撞上游戏并发改页表的瞬态失败占丢实体
+ *     失败的绝对大头，translate 失败原地重试 3 次（cpu_relax，不睡眠）；
+ *     短读（0<有效<请求，跨页撕裂）整体重试 1 次。
  */
-ssize_t oplus_frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
-			     void *kbuf, size_t size)
+#define OPLUS_FRAME_SYNC_READ_RETRY	3
+
+static phys_addr_t oplus_frame_sync_translate_retry(struct mm_struct *mm,
+						    uintptr_t va)
+{
+	phys_addr_t pa;
+	u32 t;
+
+	for (t = 0; t < OPLUS_FRAME_SYNC_READ_RETRY; t++) {
+		pa = oplus_frame_sync_translate(mm, va);
+		if (pa)
+			return pa;
+		cpu_relax();
+	}
+	return 0;
+}
+
+static ssize_t oplus_frame_sync_read_kbuf_once(struct mm_struct *mm,
+					       uintptr_t addr, void *kbuf,
+					       size_t size)
 {
 	phys_addr_t pa;
 	size_t max_chunk;
 	size_t count = 0;
 	u8 *dst = kbuf;
 
-	if (!mm || !kbuf || size == 0)
-		return -EINVAL;
-
 	while (size > 0) {
 		max_chunk = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)),
 				min(size, PAGE_SIZE));
 
-		pa = oplus_frame_sync_translate(mm, addr);
+		pa = oplus_frame_sync_translate_retry(mm, addr);
 
 		/* B1：失败页置零跳过，保持偏移对齐，不丢洞后数据 */
 		if (!pa ||
@@ -221,61 +218,18 @@ ssize_t oplus_frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
 	return (count > 0 ? count : -EFAULT);
 }
 
-/*
- * 读/写目标进程物理内存。
- * 返回：>0 实际字节数；-EINVAL 参数错；-ESRCH 进程不存在。
- * 跨页读取时遇到未驻留页即停（返回已成功部分）。
- */
-ssize_t oplus_frame_sync_rw_mem(pid_t pid, uintptr_t addr, void *buffer,
-			  size_t size, bool iswrite)
+ssize_t oplus_frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
+			     void *kbuf, size_t size)
 {
-	struct task_struct *task;
-	struct mm_struct *mm;
-	struct pid *pid_struct;
-	phys_addr_t pa;
-	size_t max_chunk;
-	size_t count = 0;
+	ssize_t r;
 
-	if (size <= 0 || buffer == NULL)
+	if (!mm || !kbuf || size == 0)
 		return -EINVAL;
 
-	pid_struct = find_get_pid(pid);
-	if (!pid_struct)
-		return -ESRCH;
-	task = get_pid_task(pid_struct, PIDTYPE_PID);
-	put_pid(pid_struct);
-	if (!task)
-		return -ESRCH;
-	mm = get_task_mm(task);
-	put_task_struct(task);
-	if (!mm)
-		return -ESRCH;
-
-	MM_READ_LOCK(mm);
-	while (size > 0) {
-		pa = oplus_frame_sync_translate(mm, addr);
-		if (!pa)
-			break;
-
-		max_chunk = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)),
-				min(size, PAGE_SIZE));
-
-		if (iswrite
-		    ? !oplus_frame_sync_write_phys(pa, buffer, max_chunk)
-		    : !oplus_frame_sync_read_phys(pa, buffer, max_chunk))
-			break;
-
-		count += max_chunk;
-		size -= max_chunk;
-		buffer += max_chunk;
-		addr += max_chunk;
-
-		cond_resched();
-	}
-	MM_READ_UNLOCK(mm);
-	mmput(mm);
-
-	return (count > 0 ? count : -EFAULT);
+	r = oplus_frame_sync_read_kbuf_once(mm, addr, kbuf, size);
+	if (r > 0 && (size_t)r < size)
+		r = oplus_frame_sync_read_kbuf_once(mm, addr, kbuf, size);
+	return r;
 }
 
 /*
