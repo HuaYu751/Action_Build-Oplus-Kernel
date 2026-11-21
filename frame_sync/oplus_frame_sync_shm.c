@@ -105,6 +105,28 @@ static struct oplus_frame_sync_zone *oplus_frame_sync_shm_zone(struct oplus_fram
 	return (struct oplus_frame_sync_zone *)d->kaddr[0];
 }
 
+/* 共享池页在内核侧不一定物理连续：跨页字段必须按页拷贝，不能直接当一整块 struct 读。
+ * 返回 0 成功，-EFAULT 表示页映射/长度异常。 */
+static int oplus_frame_sync_shm_copy_out(struct oplus_frame_sync_dev *d,
+					 size_t off, void *dst, size_t len)
+{
+	u8 *out = (u8 *)dst;
+
+	while (len) {
+		size_t po = off & ~PAGE_MASK;
+		size_t n = min_t(size_t, len, PAGE_SIZE - po);
+		void *src = oplus_frame_sync_shm_ptr(d, off, n);
+
+		if (!src)
+			return -EFAULT;
+		memcpy(out, src, n);
+		off += n;
+		out += n;
+		len -= n;
+	}
+	return 0;
+}
+
 static struct oplus_frame_sync_cmd *oplus_frame_sync_shm_cmd(struct oplus_frame_sync_dev *d, u32 idx)
 {
 	size_t off = offsetof(struct oplus_frame_sync_zone, cmds) +
@@ -385,18 +407,25 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 		break;
 
 	case OPLUS_FRAME_SYNC_CMD_SET_JOBS: {
-		/* 前端已写好 zone.jobs[0..hdr.job_num)，这里逐条校验后拷入本地副本 */
-		u32 want = (u32)z->hdr.job_num, n, i;
+		/* 前端已写好 zone.jobs[0..hdr.job_num)。共享池页不保证物理连续，
+		 * 必须逐条按页拷出到临时 job 再校验，禁止 memcpy(d->jobs, z->jobs)。 */
+		u32 want = (u32)z->hdr.job_num, n = 0, i;
 
 		if (want > OPLUS_FRAME_SYNC_JOB_MAX)
 			want = OPLUS_FRAME_SYNC_JOB_MAX;
-		for (i = 0, n = 0; i < want; i++) {
-			if (oplus_frame_sync_job_valid(&z->jobs[i], i))
-				n = i + 1;	/* 前缀合法条数（允许尾部留空） */
-			else
+		for (i = 0; i < want; i++) {
+			struct oplus_frame_sync_job tmp;
+
+			if (oplus_frame_sync_shm_copy_out(d,
+					offsetof(struct oplus_frame_sync_zone, jobs) +
+					(size_t)i * sizeof(tmp),
+					&tmp, sizeof(tmp)) != 0)
 				break;
+			if (!oplus_frame_sync_job_valid(&tmp, i))
+				break;
+			d->jobs[i] = tmp;
+			n = i + 1;	/* 前缀合法条数（允许尾部留空） */
 		}
-		memcpy(d->jobs, (const void *)z->jobs, n * sizeof(d->jobs[0]));
 		d->job_num = n;
 		break;
 	}
