@@ -19,7 +19,7 @@
  *             put_task_struct / mmput / copy_to_user / copy_from_user /
  *             cond_resched / pfn_valid
  *   - 宏/内联（无需导出）：pgd_offset / pte_offset_kernel / phys_to_virt /
- *             __phys_to_pfn / mmap_read_lock
+ *             __phys_to_pfn / rcu_read_lock
  *   若 modpost 报某符号 undefined，按 emo 做法内联等价实现。
  */
 
@@ -37,6 +37,7 @@
 #include <linux/io.h>
 #include <linux/kobject.h>
 #include <linux/list.h>
+#include <linux/rcupdate.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -48,16 +49,6 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-#include <linux/mmap_lock.h>
-#define MM_READ_LOCK(mm) mmap_read_lock(mm);
-#define MM_READ_UNLOCK(mm) mmap_read_unlock(mm);
-#else
-#include <linux/rwsem.h>
-#define MM_READ_LOCK(mm) down_read(&(mm)->mmap_sem);
-#define MM_READ_UNLOCK(mm) up_read(&(mm)->mmap_sem);
 #endif
 
 #include "oplus_frame_sync.h"
@@ -160,10 +151,15 @@ static inline int oplus_frame_sync_valid_phys_addr_range(phys_addr_t addr, size_
  *
  * 无锁调用：依赖调用方持有 mm 引用，靠 pfn_valid + 地址范围校验兜底垃圾 phys。
  * B1：未驻留/非法页不中断，memset 置零后翻下一页（偏移对齐不错位），
- *     返回值 = 实际有效字节数，全失败才 -EFAULT。
+ *     返回值 = 实际有效字节数，全失败才 -EFAULT；短读由调用方判 != size 拦截。
  * F1（工单_读取稳定性_v1）：无锁遍历撞上游戏并发改页表的瞬态失败占丢实体
  *     失败的绝对大头，translate 失败原地重试 3 次（cpu_relax，不睡眠）；
  *     短读（0<有效<请求，跨页撕裂）整体重试 1 次。
+ * P1（2026-11-22 文献优化，gup_fast 同款，MMU Handbook ch.9）：每块 translate+
+ *     memcpy 用 rcu_read_lock 包裹——遍历期间页表页不会被释放；经典 RCU 读侧
+ *     不可睡眠，故锁粒度为"每块"，cond_resched 保持在锁外。
+ * P3（同款文献 pte_same 模式）：memcpy 后重翻一次页表比对物理地址，不一致
+ *     说明页被换/重映射、数据可能撕裂，整块重试 1 次，仍不一致置零当失败。
  */
 #define OPLUS_FRAME_SYNC_READ_RETRY	3
 
@@ -182,11 +178,50 @@ static phys_addr_t oplus_frame_sync_translate_retry(struct mm_struct *mm,
 	return 0;
 }
 
+/*
+ * 单块直读（不超一页、不跨页）：翻译 -> 双校验 -> 直读 -> 序校验。
+ * 返回实际有效字节数（chunk 或 0）；失败时缓冲区已置零，偏移保持。
+ */
+static size_t oplus_frame_sync_read_chunk(struct mm_struct *mm,
+					  uintptr_t addr, u8 *dst,
+					  size_t chunk)
+{
+	phys_addr_t pa1, pa2;
+	u32 t;
+
+	for (t = 0; t < 2; t++) {
+		rcu_read_lock();
+		pa1 = oplus_frame_sync_translate_retry(mm, addr);
+		if (pa1 && pfn_valid(__phys_to_pfn(pa1)) &&
+		    IS_VALID_PHYS_ADDR_RANGE(pa1, chunk)) {
+			/* 线性映射直读：无 fault、无 GUP、不置 AF 位 */
+			memcpy(dst, phys_to_virt(pa1), chunk);
+			/* P3 序校验：复读 PTE，物理地址漂移 = 数据可能撕裂 */
+			pa2 = oplus_frame_sync_translate(mm, addr);
+		} else {
+			pa1 = 0;
+			pa2 = 0;
+		}
+		rcu_read_unlock();
+
+		if (!pa1) {
+			memset(dst, 0, chunk);
+			return 0;
+		}
+		if (pa2 == pa1)
+			return chunk;
+		cpu_relax();
+	}
+
+	/* 两次序校验都不一致：页在抖动，置零当失败（上层按短读拦截） */
+	memset(dst, 0, chunk);
+	return 0;
+}
+
 static ssize_t oplus_frame_sync_read_kbuf_once(struct mm_struct *mm,
 					       uintptr_t addr, void *kbuf,
 					       size_t size)
 {
-	phys_addr_t pa;
 	size_t max_chunk;
 	size_t count = 0;
 	u8 *dst = kbuf;
@@ -195,18 +230,8 @@ static ssize_t oplus_frame_sync_read_kbuf_once(struct mm_struct *mm,
 		max_chunk = min(PAGE_SIZE - (addr & (PAGE_SIZE - 1)),
 				min(size, PAGE_SIZE));
 
-		pa = oplus_frame_sync_translate_retry(mm, addr);
-
-		/* B1：失败页置零跳过，保持偏移对齐，不丢洞后数据 */
-		if (!pa ||
-		    !pfn_valid(__phys_to_pfn(pa)) ||
-		    !IS_VALID_PHYS_ADDR_RANGE(pa, max_chunk)) {
-			memset(dst, 0, max_chunk);
-		} else {
-			/* 线性映射直读：无 fault、无 GUP、不置 AF 位 */
-			memcpy(dst, phys_to_virt(pa), max_chunk);
-			count += max_chunk;
-		}
+		/* B1：失败页由 read_chunk 置零跳过，保持偏移对齐，不丢洞后数据 */
+		count += oplus_frame_sync_read_chunk(mm, addr, dst, max_chunk);
 
 		size -= max_chunk;
 		dst += max_chunk;
