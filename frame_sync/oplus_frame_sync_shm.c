@@ -53,6 +53,23 @@ struct oplus_frame_sync_field {
 	u32 tag;
 };
 
+/*
+ * F3（工单_读取稳定性_v1）：槽位链缓存 + 沿用上帧。
+ * 数组下标 i 在整局内稳定（实测 5/5 轮不变），把每人解出的指针链缓存起来，
+ * act 变化才重解；本帧重试后仍读不出时，发布本槽上次成功数据（_rsv[0]=
+ * 陈旧毫秒数），连续失败超过 KEEP 才真丢。恶魔"画上一帧"的内核等价物。
+ */
+#define OPLUS_FRAME_SYNC_SLOT_KEEP_US	300000u
+#define OPLUS_FRAME_SYNC_SLOT_MAX	OPLUS_FRAME_SYNC_ENTITY_MAX
+
+struct oplus_frame_sync_esp_slot {
+	u64 act;			/* 本槽当前 actor（变化即重置） */
+	u64 e1, e2, eh, root, ps;	/* 已解出的链（act 不变则复用） */
+	struct oplus_frame_sync_entity ent;	/* 上次成功发布的数据 */
+	u64 last_good_us;	/* 上次真实读成功时间（ktime us） */
+	u32 have;			/* ent 有效 */
+};
+
 struct oplus_frame_sync_dev {
 
 	struct page **pages;
@@ -85,6 +102,9 @@ struct oplus_frame_sync_dev {
 	u32 bone_act_num;
 	u64 name_ps[OPLUS_FRAME_SYNC_ENTITY_MAX];
 	u32 name_rr;
+
+	/* F3：槽位链缓存 + 沿用上帧（按数组下标，reset 见 sample_esp） */
+	struct oplus_frame_sync_esp_slot esp_slot[OPLUS_FRAME_SYNC_SLOT_MAX];
 
 	/* ESP 全链批量读暂存（lazy 申请，detach 释放；串行采样单例安全） */
 	u8 *scratch;
@@ -1012,14 +1032,16 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 	if (!cam || !lv)
 		return;
 
-	/* 相机（pos 12B 连读 + pitch/yaw/fov；fov 撕裂帧兜底 96°） */
+	/* 相机（pos 12B 连读 + pitch/yaw/fov）。
+	 * F2：整批校验后才写入；撕裂帧整批不发布，池内保留上一帧相机——
+	 * 不再 memset 清零（清零会让前端拿到 (0,0,0) 相机整屏飞出）。 */
 	if (mask & OPLUS_FRAME_SYNC_FLAG_CAMERA) {
 		struct oplus_frame_sync_camera *c = oplus_frame_sync_shm_cam(d, buf);
 		u32 pv[3] = { 0 };
 		u32 pitch = 0, yaw = 0, fov = 0;
+		bool pos_ok, fov_ok;
 
 		if (c) {
-			memset(c, 0, sizeof(*c));
 			oplus_frame_sync_read_kbuf(d->tg_mm, cam + cfg->cam_pos_off,
 						   pv, sizeof(pv));
 			oplus_frame_sync_read_kbuf(d->tg_mm, cam + cfg->cam_pitch_off,
@@ -1028,16 +1050,21 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 						   &yaw, sizeof(yaw));
 			oplus_frame_sync_read_kbuf(d->tg_mm, cam + cfg->cam_fov_off,
 						   &fov, sizeof(fov));
-			/* 30°..130° 之外视为撕裂帧，回退 96°（位型整数比较） */
-			if ((fov & 0x80000000u) || !oplus_frame_sync_f32_isfinite(fov) ||
-			    fov < 0x41F00000u || fov > 0x43020000u)
-				fov = 0x42C00000u;
-			oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_PX, pv[0], z);
-			oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_PY, pv[1], z);
-			oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_PZ, pv[2], z);
-			oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_RX, pitch, z);
-			oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_RY, yaw, z);
-			oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_FOV, fov, z);
+			pos_ok = (pv[0] | pv[1] | pv[2]) != 0 &&
+				 oplus_frame_sync_f32_isfinite(pv[0]) &&
+				 oplus_frame_sync_f32_isfinite(pv[1]) &&
+				 oplus_frame_sync_f32_isfinite(pv[2]);
+			fov_ok = !((fov & 0x80000000u) ||
+				   !oplus_frame_sync_f32_isfinite(fov) ||
+				   fov < 0x41F00000u || fov > 0x43020000u);
+			if (pos_ok && fov_ok) {
+				oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_PX, pv[0], z);
+				oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_PY, pv[1], z);
+				oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_PZ, pv[2], z);
+				oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_RX, pitch, z);
+				oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_RY, yaw, z);
+				oplus_frame_sync_shm_store_camera(c, OPLUS_FRAME_SYNC_F_CAM_FOV, fov, z);
+			}
 		}
 	}
 
@@ -1071,26 +1098,56 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 	out = 0;
 	d->bone_act_num = 0;
 	if (mask & OPLUS_FRAME_SYNC_FLAG_ENTITY) {
+		u64 now_us = ktime_get_ns() / 1000;
+
 		for (i = 0; i < (u32)cnt && out < OPLUS_FRAME_SYNC_ENTITY_MAX; i++) {
 			u64 act = d->acts[i];
-			u64 e1, e2, e3, eh, root, ps;
+			u64 e1, e2, eh, root, ps;
 			u32 min_off = 0, max_end = 0, nb;
 			u32 hp = 0, hpmax = 0, armor = 0, armormax = 0;
 			u32 pos[3] = { 0 };
 			u32 team = 0;
 			u8 weapon = 0;
 			struct oplus_frame_sync_entity *e;
+			struct oplus_frame_sync_esp_slot *sl = NULL;
 
 			if (!act || act == pawn)
 				continue;
-			e1 = oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->e1_off);
+
+			/* F3：槽位缓存按数组下标；act 变化即重置（防串人） */
+			if (i < OPLUS_FRAME_SYNC_SLOT_MAX) {
+				sl = &d->esp_slot[i];
+				if (sl->act != act) {
+					sl->act = act;
+					sl->e1 = sl->e2 = sl->eh = 0;
+					sl->root = sl->ps = 0;
+					sl->have = 0;
+				}
+			}
+
+			/* 链缓存：act→ASC→属性集→eh 只解一次，本帧只重读易变字段 */
+			e1 = (sl && sl->e1) ? sl->e1 :
+				oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->e1_off);
 			if (!e1)
-				continue;
-			e2 = oplus_frame_sync_shm_rd64(d->tg_mm, e1 + cfg->e2_off);
+				goto slot_fail;
+			if (sl)
+				sl->e1 = e1;
+
+			e2 = (sl && sl->e2) ? sl->e2 :
+				oplus_frame_sync_shm_rd64(d->tg_mm, e1 + cfg->e2_off);
 			if (!e2)
-				continue;
-			e3 = oplus_frame_sync_shm_rd64(d->tg_mm, e2);
-			eh = e3 ? e3 : e2;	/* 兜底链 */
+				goto slot_fail;
+			if (sl)
+				sl->e2 = e2;
+
+			eh = (sl && sl->eh) ? sl->eh : 0;
+			if (!eh) {
+				u64 e3 = oplus_frame_sync_shm_rd64(d->tg_mm, e2);
+
+				eh = e3 ? e3 : e2;	/* 兜底链 */
+				if (sl)
+					sl->eh = eh;
+			}
 
 			/* B2：eh 属性区间（hp/hpmax/armor/armormax）一次批量读 */
 			{
@@ -1108,10 +1165,10 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 				}
 				nb = max_end - min_off;
 				if (nb > OPLUS_FRAME_SYNC_EH_BATCH_MAX)
-					continue;
+					goto slot_fail;
 				if (oplus_frame_sync_read_kbuf(d->tg_mm, eh + min_off,
 							       d->scratch, nb) <= 0)
-					continue;
+					goto slot_fail;
 				memcpy(&hp,       d->scratch + (cfg->hp_off - min_off), 4);
 				memcpy(&hpmax,    d->scratch + (cfg->hpmax_off - min_off), 4);
 				memcpy(&armor,    d->scratch + (cfg->armor_off - min_off), 4);
@@ -1120,24 +1177,38 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 
 			/* 过滤：0 < hp <= 300.0f（0x43960000，位型比较） */
 			if (!oplus_frame_sync_f32_pos_le(hp, 0x43960000u))
-				continue;
+				goto slot_fail;
 
-			root = oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->root_off);
+			root = (sl && sl->root) ? sl->root :
+				oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->root_off);
 			if (!root)
-				continue;
+				goto slot_fail;
+			if (sl)
+				sl->root = root;
+
 			if (oplus_frame_sync_read_kbuf(d->tg_mm, root + cfg->pos_off,
 						       pos, sizeof(pos)) <= 0)
-				continue;
+				goto slot_fail;
 			if (!oplus_frame_sync_f32_isfinite(pos[0]) ||
-			    !oplus_frame_sync_f32_isfinite(pos[1]))
-				continue;
+			    !oplus_frame_sync_f32_isfinite(pos[1]) ||
+			    !oplus_frame_sync_f32_isfinite(pos[2]))
+				goto slot_fail;
 
-			ps = oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->ps_off);
-			if (ps)
+			ps = (sl && sl->ps) ? sl->ps :
+				oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->ps_off);
+			if (sl && !sl->ps)
+				sl->ps = ps;
+			if (ps) {
 				team = (u32)oplus_frame_sync_shm_rd32(d->tg_mm,
 								      ps + cfg->team_off);
+				/* F4：垃圾值沿用该槽上帧队伍，防敌人被当队友跳过 */
+				if (team > 8u)
+					team = (sl && sl->have) ? sl->ent.team : 0u;
+			}
 			oplus_frame_sync_read_kbuf(d->tg_mm, act + cfg->weapon_off,
 						   &weapon, sizeof(weapon));
+			if (!weapon && sl && sl->have)
+				weapon = (u8)sl->ent.weapon;	/* F4：读失败/瞬态 0 沿用 */
 
 			e = oplus_frame_sync_shm_ent(d, buf, out);
 			if (!e) {
@@ -1154,6 +1225,7 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_ARMOR, armor, z);
 			e->team = team;
 			e->weapon = weapon;
+			e->_rsv[0] = 0;	/* F3：0 = 本帧新鲜数据 */
 
 			d->bone_acts[out] = act;
 			d->bone_act_num = out + 1;
@@ -1161,7 +1233,33 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 			/* 名字：ps 变了立即重读；不变则靠轮转慢刷（每帧 1 槽） */
 			if (d->name_ps[out] != ps || out == (d->name_rr & 63u))
 				oplus_frame_sync_shm_name_fill(d, out, ps);
+			if (sl) {
+				sl->ent = *e;
+				sl->last_good_us = now_us;
+				sl->have = 1;
+			}
 			out++;
+			continue;
+
+slot_fail:
+			/* F3：本帧重试后仍读不出 → 沿用上帧该槽数据（陈旧标记），
+			 * 连续失败超过 300ms 才真丢（恶魔"画上一帧"的内核等价物） */
+			if (sl && sl->have &&
+			    now_us - sl->last_good_us <= OPLUS_FRAME_SYNC_SLOT_KEEP_US) {
+				e = oplus_frame_sync_shm_ent(d, buf, out);
+				if (!e) {
+					d->errors++;
+					break;
+				}
+				*e = sl->ent;
+				e->_rsv[0] = (u32)((now_us - sl->last_good_us) / 1000);
+				d->bone_acts[out] = act;
+				d->bone_act_num = out + 1;
+				if (sl->ps &&
+				    (d->name_ps[out] != sl->ps || out == (d->name_rr & 63u)))
+					oplus_frame_sync_shm_name_fill(d, out, sl->ps);
+				out++;
+			}
 		}
 	}
 	d->name_rr++;
@@ -1178,10 +1276,12 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 	}
 	z->hdr.entity_num = out;
 
-	/* 自身数据 → ext 保留槽 28..31（camp/子弹/手持） */
+	/* 自身数据 → ext 保留槽 28..31（camp/子弹/手持）。
+	 * F4：读失败/校验不过不覆盖旧值，HUD 不闪。 */
 	{
 		u32 self_idx[4] = { 28, 29, 30, 31 };
 		u64 vals[4] = { 0, (u64)-1, (u64)-1, (u64)-1 };
+		u8 have[4] = { 0, 0, 0, 0 };
 		u32 tags[4] = { OPLUS_FRAME_SYNC_TAG_SELF_CAMP,
 				OPLUS_FRAME_SYNC_TAG_AMMO_CUR,
 				OPLUS_FRAME_SYNC_TAG_AMMO_MAX,
@@ -1193,20 +1293,28 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 		if (pawn) {
 			u64 ps_self = oplus_frame_sync_shm_rd64(d->tg_mm,
 								pawn + cfg->self_ps_off);
-			if (ps_self)
-				vals[0] = (u64)(s64)oplus_frame_sync_shm_rd32(d->tg_mm,
+			if (ps_self) {
+				s32 camp = oplus_frame_sync_shm_rd32(d->tg_mm,
 						ps_self + cfg->self_camp_off);
+
+				if (camp > 0 && camp <= 8) {
+					vals[0] = (u64)(s64)camp;
+					have[0] = 1;
+				}
+			}
 			if (cfg->gunbase_off) {
 				u64 gb = oplus_frame_sync_shm_rd64(d->tg_mm,
 								   pawn + cfg->gunbase_off);
 				if (gb) {
 					s32 amax = oplus_frame_sync_shm_rd32(d->tg_mm,
-									     gb + cfg->ammo_max_off);
+								     gb + cfg->ammo_max_off);
 					s32 used = oplus_frame_sync_shm_rd32(d->tg_mm,
-									     gb + cfg->ammo_used_off);
+								     gb + cfg->ammo_used_off);
+
 					if (amax > 0 && amax < 1000 && used >= 0 && used <= amax) {
 						vals[1] = (u64)(s64)(amax - used);
 						vals[2] = (u64)(s64)amax;
+						have[1] = have[2] = 1;
 					}
 				}
 			}
@@ -1216,8 +1324,10 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 				oplus_frame_sync_read_kbuf(d->tg_mm,
 							   pawn + cfg->self_weapon_off,
 							   &sw, sizeof(sw));
-				if (sw)
+				if (sw) {
 					vals[3] = sw;
+					have[3] = 1;
+				}
 			}
 		}
 		for (k = 0; k < 4; k++) {
@@ -1228,7 +1338,8 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 				break;
 			s->tag = tags[k];
 			s->type = types[k];
-			s->value = vals[k];
+			if (have[k])
+				s->value = vals[k];
 		}
 	}
 }
