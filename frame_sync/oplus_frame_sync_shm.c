@@ -8,6 +8,11 @@
  *   - header 字段功能语义贴原厂：buf_id 固定标识、stamp 纳秒时间戳
  *   - B2 批量读：实体/相机字段按偏移范围一次性读，页表遍历从 ~900/帧
  *     降到 ~200/帧
+ *   - 2026-11-22 架构定调（P1-P6 文献优化批）：内核瘦身为纯读取引擎——
+ *     固定槽写池（数组下标=池槽）、失败槽置 0、删全部游戏策略（hp 过滤/
+ *     team/weapon 沿用/陈旧回写）、名字每帧读；读路径加 RCU 包裹 + PTE
+ *     序校验 + 严格短读；act/ps 整块合并读；数组快照 dec/cnt 双读一致性。
+ *     分类、过滤、沿用上帧全部在前端。
  *
  * 设计要点：
  *   1. 一次性 pin：attach 时 pin_user_pages_remote 锁定用户态池，之后直写
@@ -45,6 +50,7 @@
 #define OPLUS_FRAME_SYNC_SCRATCH_SIZE     (64u * 1024u)   /* ESP 全链批量读暂存 */
 #define OPLUS_FRAME_SYNC_ACT_MAX          512             /* ESP 全链候选 actor 上限 */
 #define OPLUS_FRAME_SYNC_EH_BATCH_MAX     512             /* eh 属性区间批量读上限 */
+#define OPLUS_FRAME_SYNC_PS_BATCH_MAX     2048            /* P4：ps 区间整块读上限 */
 
 struct oplus_frame_sync_field {
 	u8  used;
@@ -54,20 +60,15 @@ struct oplus_frame_sync_field {
 };
 
 /*
- * F3（工单_读取稳定性_v1）：槽位链缓存 + 沿用上帧。
- * 数组下标 i 在整局内稳定（实测 5/5 轮不变），把每人解出的指针链缓存起来，
- * act 变化才重解；本帧重试后仍读不出时，发布本槽上次成功数据（_rsv[0]=
- * 陈旧毫秒数），连续失败超过 KEEP 才真丢。恶魔"画上一帧"的内核等价物。
+ * 槽位链缓存（按数组下标，2026-11-22 架构定调后纯读取优化件）：
+ * 数组下标 i 在整局内稳定（实测 5/5 轮不变），act 不变则 e1/e2/eh 指针链
+ * 只解一次。不含任何游戏策略——"该不该显示/沿用上帧"由前端决定。
  */
-#define OPLUS_FRAME_SYNC_SLOT_KEEP_US	300000u
 #define OPLUS_FRAME_SYNC_SLOT_MAX	OPLUS_FRAME_SYNC_ENTITY_MAX
 
 struct oplus_frame_sync_esp_slot {
 	u64 act;			/* 本槽当前 actor（变化即重置） */
-	u64 e1, e2, eh, root, ps;	/* 已解出的链（act 不变则复用） */
-	struct oplus_frame_sync_entity ent;	/* 上次成功发布的数据 */
-	u64 last_good_us;	/* 上次真实读成功时间（ktime us） */
-	u32 have;			/* ent 有效 */
+	u64 e1, e2, eh;			/* 血量/属性链（act 不变则复用） */
 };
 
 struct oplus_frame_sync_dev {
@@ -96,14 +97,12 @@ struct oplus_frame_sync_dev {
 	/* ESP 全链配置（SET_ESP_CFG 时从 zone 拷入；l0_off != 0 即进入全链模式） */
 	struct oplus_frame_sync_esp_cfg esp_cfg;
 
-	/* ESP 全链采样状态：候选 actor、与 ents 输出对齐的骨骼 actor、名字 ps 缓存 */
+	/* ESP 全链采样状态：候选 actor、与 ents 输出对齐的骨骼 actor */
 	u64 acts[OPLUS_FRAME_SYNC_ACT_MAX];
 	u64 bone_acts[OPLUS_FRAME_SYNC_ENTITY_MAX];
 	u32 bone_act_num;
-	u64 name_ps[OPLUS_FRAME_SYNC_ENTITY_MAX];
-	u32 name_rr;
 
-	/* F3：槽位链缓存 + 沿用上帧（按数组下标，reset 见 sample_esp） */
+	/* 槽位链缓存（按数组下标；reset_params 清空） */
 	struct oplus_frame_sync_esp_slot esp_slot[OPLUS_FRAME_SYNC_SLOT_MAX];
 
 	/* ESP 全链批量读暂存（lazy 申请，detach 释放；串行采样单例安全） */
@@ -378,8 +377,7 @@ static void oplus_frame_sync_shm_reset_params(struct oplus_frame_sync_dev *d)
 	memset(d->fld, 0, sizeof(d->fld));
 	memset(&d->bone_cfg, 0, sizeof(d->bone_cfg));
 	memset(&d->esp_cfg, 0, sizeof(d->esp_cfg));
-	memset(d->name_ps, 0, sizeof(d->name_ps));
-	d->name_rr = 0;
+	memset(d->esp_slot, 0, sizeof(d->esp_slot));
 	d->bone_act_num = 0;
 }
 
@@ -953,15 +951,6 @@ static inline bool oplus_frame_sync_f32_isfinite(u32 bits)
 	return (bits & 0x7F800000u) != 0x7F800000u;
 }
 
-static inline bool oplus_frame_sync_f32_pos_le(u32 bits, u32 le_bits)
-{
-	if (!bits || (bits & 0x80000000u))
-		return false;
-	if (!oplus_frame_sync_f32_isfinite(bits))
-		return false;
-	return bits <= le_bits;
-}
-
 /* 名字读取：ps → FString（主用，失败走兜底），原始 UTF-16LE 写 name 区（单缓冲） */
 static void oplus_frame_sync_shm_name_fill(struct oplus_frame_sync_dev *d,
 					   u32 idx, u64 ps)
@@ -986,16 +975,16 @@ static void oplus_frame_sync_shm_name_fill(struct oplus_frame_sync_dev *d,
 		}
 	}
 	if (!nptr || nnum <= 0 || nnum > (s32)(OPLUS_FRAME_SYNC_NAME_DATA / 2)) {
-		d->name_ps[idx] = ps;
 		return;	/* len = 0，前端显示匿名 */
 	}
 
 	bytes = (u32)nnum * 2;
 	if (bytes > OPLUS_FRAME_SYNC_NAME_DATA)
 		bytes = OPLUS_FRAME_SYNC_NAME_DATA;
-	if (oplus_frame_sync_read_kbuf(d->tg_mm, nptr, nm->data, bytes) > 0)
+	/* 严格短读：不完整的名字宁可匿名，不喂半串数据 */
+	if (oplus_frame_sync_read_kbuf(d->tg_mm, nptr, nm->data, bytes) ==
+	    (ssize_t)bytes)
 		nm->len = bytes;
-	d->name_ps[idx] = ps;
 }
 
 static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
@@ -1005,7 +994,9 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 	const struct oplus_frame_sync_esp_cfg *cfg = &d->esp_cfg;
 	u64 l0, pc, w1, w, cam, pawn, lv, dec;
 	s32 cnt;
-	u32 i, out, arr_bytes;
+	u32 i, arr_bytes, ent_num;
+	u32 act_min = 0, act_span = 0, ps_min = 0, ps_span = 0;
+	bool act_bulk = false, ps_bulk = false;
 
 	if (!d->scratch) {
 		d->scratch = kvzalloc(OPLUS_FRAME_SYNC_SCRATCH_SIZE, GFP_KERNEL);
@@ -1068,22 +1059,37 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 		}
 	}
 
-	/* 实体数组（整读进 scratch，再隔层取 actor） */
-	dec = oplus_frame_sync_shm_rd64(d->tg_mm, lv + cfg->dec_off);
-	cnt = oplus_frame_sync_shm_rd32(d->tg_mm, lv + cfg->cnt_off);
-	if (!dec || cnt <= 0 || cnt > 1024)
-		return;
-	if (!cfg->arr_stride || cfg->arr_stride > 64)
-		return;
-	arr_bytes = (u32)cnt * cfg->arr_stride;
-	if (arr_bytes > OPLUS_FRAME_SYNC_SCRATCH_SIZE) {
-		cnt = OPLUS_FRAME_SYNC_SCRATCH_SIZE / cfg->arr_stride;
-		arr_bytes = (u32)cnt * cfg->arr_stride;
+	/* 实体数组（整读进 scratch，再隔层取 actor）
+	 * P5 快照一致性：整读完后复读 dec/cnt，数组在采样中被重建则重试 1 次，
+	 * 仍不一致本帧不发布（前端持上一帧），杜绝新旧数组混叠。 */
+	for (i = 0; i < 2; i++) {
+		s32 n;
+		u64 a;
+
+		a = oplus_frame_sync_shm_rd64(d->tg_mm, lv + cfg->dec_off);
+		n = oplus_frame_sync_shm_rd32(d->tg_mm, lv + cfg->cnt_off);
+		if (!a || n <= 0 || n > 1024)
+			return;
+		if (!cfg->arr_stride || cfg->arr_stride > 64)
+			return;
+		arr_bytes = (u32)n * cfg->arr_stride;
+		if (arr_bytes > OPLUS_FRAME_SYNC_SCRATCH_SIZE) {
+			n = OPLUS_FRAME_SYNC_SCRATCH_SIZE / cfg->arr_stride;
+			arr_bytes = (u32)n * cfg->arr_stride;
+		}
+		if (oplus_frame_sync_read_kbuf(d->tg_mm, a, d->scratch, arr_bytes) !=
+		    (ssize_t)arr_bytes) {
+			d->errors++;
+			return;
+		}
+		dec = a;
+		cnt = n;
+		if (oplus_frame_sync_shm_rd64(d->tg_mm, lv + cfg->dec_off) == dec &&
+		    oplus_frame_sync_shm_rd32(d->tg_mm, lv + cfg->cnt_off) == cnt)
+			break;	/* 快照一致 */
 	}
-	if (oplus_frame_sync_read_kbuf(d->tg_mm, dec, d->scratch, arr_bytes) <= 0) {
-		d->errors++;
-		return;
-	}
+	if (i >= 2)
+		return;	/* 两次都撕裂：本帧放弃，等下一帧 */
 
 	if (cnt > OPLUS_FRAME_SYNC_ACT_MAX)
 		cnt = OPLUS_FRAME_SYNC_ACT_MAX;
@@ -1095,12 +1101,54 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 			oplus_frame_sync_shm_rd64(d->tg_mm, layer + cfg->act_off) : 0;
 	}
 
-	out = 0;
-	d->bone_act_num = 0;
-	if (mask & OPLUS_FRAME_SYNC_FLAG_ENTITY) {
-		u64 now_us = ktime_get_ns() / 1000;
+	/* P4 整块读区间（运行时由配置偏移推导，通用无游戏语义）：
+	 * actor 段 root/ps/weapon 合并一次读；PlayerState 段 team+两组名字
+	 * 指针合并一次读。跨度超上限回退逐字段读（仍严格短读）。 */
+	{
+		u32 lo, hi;
 
-		for (i = 0; i < (u32)cnt && out < OPLUS_FRAME_SYNC_ENTITY_MAX; i++) {
+		lo = cfg->root_off;
+		if (cfg->ps_off < lo)
+			lo = cfg->ps_off;
+		if (cfg->weapon_off < lo)
+			lo = cfg->weapon_off;
+		hi = cfg->root_off + 8;
+		if (cfg->ps_off + 8 > hi)
+			hi = cfg->ps_off + 8;
+		if (cfg->weapon_off + 1 > hi)
+			hi = cfg->weapon_off + 1;
+		if (hi > lo && hi - lo <= OPLUS_FRAME_SYNC_EH_BATCH_MAX) {
+			act_min = lo;
+			act_span = hi - lo;
+			act_bulk = true;
+		}
+
+		lo = cfg->team_off;
+		if (cfg->name_ptr_off < lo)
+			lo = cfg->name_ptr_off;
+		if (cfg->name_ptr2_off < lo)
+			lo = cfg->name_ptr2_off;
+		hi = cfg->team_off + 4;
+		if (cfg->name_cnt_off + 4 > hi)
+			hi = cfg->name_cnt_off + 4;
+		if (cfg->name_cnt2_off + 4 > hi)
+			hi = cfg->name_cnt2_off + 4;
+		if (hi > lo && hi - lo <= OPLUS_FRAME_SYNC_PS_BATCH_MAX) {
+			ps_min = lo;
+			ps_span = hi - lo;
+			ps_bulk = true;
+		}
+	}
+
+	/* 固定槽写池（2026-11-22 架构定调）：数组第 i 个 → 池槽 i。
+	 * 成功写数据；失败/空槽/自己写全 0（hp=0 = 无效位）。
+	 * 分类、过滤、沿用上帧全部由前端负责，内核只读只搬。 */
+	ent_num = (u32)cnt < OPLUS_FRAME_SYNC_ENTITY_MAX ?
+		(u32)cnt : OPLUS_FRAME_SYNC_ENTITY_MAX;
+	d->bone_act_num = 0;
+
+	if (mask & OPLUS_FRAME_SYNC_FLAG_ENTITY) {
+		for (i = 0; i < ent_num; i++) {
 			u64 act = d->acts[i];
 			u64 e1, e2, eh, root, ps;
 			u32 min_off = 0, max_end = 0, nb;
@@ -1108,48 +1156,48 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 			u32 pos[3] = { 0 };
 			u32 team = 0;
 			u8 weapon = 0;
-			struct oplus_frame_sync_entity *e;
-			struct oplus_frame_sync_esp_slot *sl = NULL;
+			struct oplus_frame_sync_esp_slot *sl = &d->esp_slot[i];
+			struct oplus_frame_sync_entity *e =
+				oplus_frame_sync_shm_ent(d, buf, i);
+			struct oplus_frame_sync_name *nm0 =
+				oplus_frame_sync_shm_name(d, i);
+
+			d->bone_acts[i] = 0;
+			if (nm0)
+				memset(nm0, 0, sizeof(*nm0));
+			if (!e) {
+				d->errors++;
+				break;
+			}
+			memset(e, 0, sizeof(*e));
 
 			if (!act || act == pawn)
-				continue;
+				continue;	/* 槽位保持全 0 = 无效 */
 
-			/* F3：槽位缓存按数组下标；act 变化即重置（防串人） */
-			if (i < OPLUS_FRAME_SYNC_SLOT_MAX) {
-				sl = &d->esp_slot[i];
-				if (sl->act != act) {
-					sl->act = act;
-					sl->e1 = sl->e2 = sl->eh = 0;
-					sl->root = sl->ps = 0;
-					sl->have = 0;
-				}
+			/* 链缓存：act→e1→e2→属性集(eh) 只解一次，act 变化即重置 */
+			if (sl->act != act) {
+				sl->act = act;
+				sl->e1 = sl->e2 = sl->eh = 0;
 			}
-
-			/* 链缓存：act→ASC→属性集→eh 只解一次，本帧只重读易变字段 */
-			e1 = (sl && sl->e1) ? sl->e1 :
+			e1 = sl->e1 ? sl->e1 :
 				oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->e1_off);
 			if (!e1)
-				goto slot_fail;
-			if (sl)
-				sl->e1 = e1;
-
-			e2 = (sl && sl->e2) ? sl->e2 :
+				continue;
+			sl->e1 = e1;
+			e2 = sl->e2 ? sl->e2 :
 				oplus_frame_sync_shm_rd64(d->tg_mm, e1 + cfg->e2_off);
 			if (!e2)
-				goto slot_fail;
-			if (sl)
-				sl->e2 = e2;
-
-			eh = (sl && sl->eh) ? sl->eh : 0;
+				continue;
+			sl->e2 = e2;
+			eh = sl->eh ? sl->eh : 0;
 			if (!eh) {
 				u64 e3 = oplus_frame_sync_shm_rd64(d->tg_mm, e2);
 
 				eh = e3 ? e3 : e2;	/* 兜底链 */
-				if (sl)
-					sl->eh = eh;
+				sl->eh = eh;
 			}
 
-			/* B2：eh 属性区间（hp/hpmax/armor/armormax）一次批量读 */
+			/* 属性区间（hp/hpmax/armor/armormax）一次批量读，严格短读 */
 			{
 				u32 offs[4] = { cfg->hp_off, cfg->hpmax_off,
 						cfg->armor_off, cfg->armormax_off };
@@ -1165,116 +1213,110 @@ static void oplus_frame_sync_shm_sample_esp(struct oplus_frame_sync_dev *d,
 				}
 				nb = max_end - min_off;
 				if (nb > OPLUS_FRAME_SYNC_EH_BATCH_MAX)
-					goto slot_fail;
+					continue;
 				if (oplus_frame_sync_read_kbuf(d->tg_mm, eh + min_off,
-							       d->scratch, nb) <= 0)
-					goto slot_fail;
+							       d->scratch, nb) !=
+				    (ssize_t)nb)
+					continue;
 				memcpy(&hp,       d->scratch + (cfg->hp_off - min_off), 4);
 				memcpy(&hpmax,    d->scratch + (cfg->hpmax_off - min_off), 4);
 				memcpy(&armor,    d->scratch + (cfg->armor_off - min_off), 4);
 				memcpy(&armormax, d->scratch + (cfg->armormax_off - min_off), 4);
 			}
 
-			/* 过滤：0 < hp <= 300.0f（0x43960000，位型比较） */
-			if (!oplus_frame_sync_f32_pos_le(hp, 0x43960000u))
-				goto slot_fail;
-
-			root = (sl && sl->root) ? sl->root :
-				oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->root_off);
+			/* P4：actor 段一次整块读（root/ps/weapon），失败回退逐字段 */
+			if (act_bulk) {
+				if (oplus_frame_sync_read_kbuf(d->tg_mm, act + act_min,
+							       d->scratch,
+							       act_span) ==
+				    (ssize_t)act_span) {
+					memcpy(&root, d->scratch +
+						       (cfg->root_off - act_min), 8);
+					memcpy(&ps, d->scratch +
+						    (cfg->ps_off - act_min), 8);
+					memcpy(&weapon, d->scratch +
+							 (cfg->weapon_off - act_min), 1);
+				} else {
+					root = oplus_frame_sync_shm_rd64(d->tg_mm,
+							act + cfg->root_off);
+					ps = oplus_frame_sync_shm_rd64(d->tg_mm,
+							act + cfg->ps_off);
+					oplus_frame_sync_read_kbuf(d->tg_mm,
+							act + cfg->weapon_off,
+							&weapon, sizeof(weapon));
+				}
+			} else {
+				root = oplus_frame_sync_shm_rd64(d->tg_mm,
+						act + cfg->root_off);
+				ps = oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->ps_off);
+				oplus_frame_sync_read_kbuf(d->tg_mm, act + cfg->weapon_off,
+							   &weapon, sizeof(weapon));
+			}
 			if (!root)
-				goto slot_fail;
-			if (sl)
-				sl->root = root;
+				continue;
 
+			/* 坐标严格短读 + 有限值通用校验（原始值直写，不过滤） */
 			if (oplus_frame_sync_read_kbuf(d->tg_mm, root + cfg->pos_off,
-						       pos, sizeof(pos)) <= 0)
-				goto slot_fail;
+						       pos, sizeof(pos)) !=
+			    (ssize_t)sizeof(pos))
+				continue;
 			if (!oplus_frame_sync_f32_isfinite(pos[0]) ||
 			    !oplus_frame_sync_f32_isfinite(pos[1]) ||
 			    !oplus_frame_sync_f32_isfinite(pos[2]))
-				goto slot_fail;
+				continue;
 
-			ps = (sl && sl->ps) ? sl->ps :
-				oplus_frame_sync_shm_rd64(d->tg_mm, act + cfg->ps_off);
-			if (sl && !sl->ps)
-				sl->ps = ps;
+			/* P4：ps 段一次整块读（team + 两组名字指针），失败回退逐字段 */
 			if (ps) {
-				team = (u32)oplus_frame_sync_shm_rd32(d->tg_mm,
-								      ps + cfg->team_off);
-				/* F4：垃圾值沿用该槽上帧队伍，防敌人被当队友跳过 */
-				if (team > 8u)
-					team = (sl && sl->have) ? sl->ent.team : 0u;
+				if (ps_bulk) {
+					if (oplus_frame_sync_read_kbuf(d->tg_mm, ps + ps_min,
+								       d->scratch,
+								       ps_span) ==
+					    (ssize_t)ps_span)
+						memcpy(&team, d->scratch +
+							      (cfg->team_off - ps_min),
+							      4);
+					else
+						team = (u32)oplus_frame_sync_shm_rd32(
+								d->tg_mm,
+								ps + cfg->team_off);
+				} else {
+					team = (u32)oplus_frame_sync_shm_rd32(d->tg_mm,
+								ps + cfg->team_off);
+				}
 			}
-			oplus_frame_sync_read_kbuf(d->tg_mm, act + cfg->weapon_off,
-						   &weapon, sizeof(weapon));
-			if (!weapon && sl && sl->have)
-				weapon = (u8)sl->ent.weapon;	/* F4：读失败/瞬态 0 沿用 */
 
-			e = oplus_frame_sync_shm_ent(d, buf, out);
-			if (!e) {
-				d->errors++;
-				break;
-			}
-			memset(e, 0, sizeof(*e));
 			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_X, pos[0], z);
 			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_Y, pos[1], z);
 			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_Z, pos[2], z);
 			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_HP, hp, z);
 			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_HP_MAX,
-							  hpmax ? hpmax : 0x42C80000u, z);
-			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_ARMOR, armor, z);
+							  hpmax, z);
+			oplus_frame_sync_shm_store_entity(e, OPLUS_FRAME_SYNC_F_ARMOR,
+							  armor, z);
 			e->team = team;
 			e->weapon = weapon;
-			e->_rsv[0] = 0;	/* F3：0 = 本帧新鲜数据 */
+			e->_rsv[0] = 0;
 
-			d->bone_acts[out] = act;
-			d->bone_act_num = out + 1;
+			d->bone_acts[i] = act;
 
-			/* 名字：ps 变了立即重读；不变则靠轮转慢刷（每帧 1 槽） */
-			if (d->name_ps[out] != ps || out == (d->name_rr & 63u))
-				oplus_frame_sync_shm_name_fill(d, out, ps);
-			if (sl) {
-				sl->ent = *e;
-				sl->last_good_us = now_us;
-				sl->have = 1;
-			}
-			out++;
-			continue;
-
-slot_fail:
-			/* F3：本帧重试后仍读不出 → 沿用上帧该槽数据（陈旧标记），
-			 * 连续失败超过 300ms 才真丢（恶魔"画上一帧"的内核等价物） */
-			if (sl && sl->have &&
-			    now_us - sl->last_good_us <= OPLUS_FRAME_SYNC_SLOT_KEEP_US) {
-				e = oplus_frame_sync_shm_ent(d, buf, out);
-				if (!e) {
-					d->errors++;
-					break;
-				}
-				*e = sl->ent;
-				e->_rsv[0] = (u32)((now_us - sl->last_good_us) / 1000);
-				d->bone_acts[out] = act;
-				d->bone_act_num = out + 1;
-				if (sl->ps &&
-				    (d->name_ps[out] != sl->ps || out == (d->name_rr & 63u)))
-					oplus_frame_sync_shm_name_fill(d, out, sl->ps);
-				out++;
-			}
+			/* 名字：ps 有效即每帧读（ps=0 保持匿名） */
+			oplus_frame_sync_shm_name_fill(d, i, ps);
 		}
+		d->bone_act_num = ent_num;
 	}
-	d->name_rr++;
 
-	/* 清掉本帧未用到槽位的旧名字（防串人） */
-	for (i = out; i < OPLUS_FRAME_SYNC_ENTITY_MAX; i++) {
-		if (d->name_ps[i]) {
-			struct oplus_frame_sync_name *nm = oplus_frame_sync_shm_name(d, i);
+	/* 数组长度之外的池槽与名字清零：standby 区确定性覆写，前端扫到的任何
+	 * 槽位都是本帧真实状态 */
+	for (i = ent_num; i < OPLUS_FRAME_SYNC_ENTITY_MAX; i++) {
+		struct oplus_frame_sync_entity *e = oplus_frame_sync_shm_ent(d, buf, i);
+		struct oplus_frame_sync_name *nm = oplus_frame_sync_shm_name(d, i);
 
-			if (nm)
-				memset(nm, 0, sizeof(*nm));
-			d->name_ps[i] = 0;
-		}
+		if (e)
+			memset(e, 0, sizeof(*e));
+		if (nm)
+			memset(nm, 0, sizeof(*nm));
 	}
-	z->hdr.entity_num = out;
+	z->hdr.entity_num = (mask & OPLUS_FRAME_SYNC_FLAG_ENTITY) ? ent_num : 0;
 
 	/* 自身数据 → ext 保留槽 28..31（camp/子弹/手持）。
 	 * F4：读失败/校验不过不覆盖旧值，HUD 不闪。 */
