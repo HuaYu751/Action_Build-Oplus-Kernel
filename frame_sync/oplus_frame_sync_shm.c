@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * oplus_frame_sync_shm.c —— 帧同步共享池通道（通用内核 v4，2026-11-22）
+ * oplus_frame_sync_shm.c —— 帧同步共享池通道（通用内核 v5，2026-11-22）
  *
- * 架构（工单_通用内核_v2.md）：内核 = 纯任务执行器，零游戏语义。
- *   前端下发任务表（job[]）→ 内核逐条执行：解析起点 → 走指针链 →
- *   连续读 N 字节 → 写统一数据格（slot）。整块失败按子段补救，
+ * 架构（工单_通用内核_v3.md）：内核 = 纯指令执行器，零游戏语义。
+ *   前端把指令直接写进共享池任务区（zone.jobs）→ 内核每帧现取现执行：
+ *   从模块基址走指针链（每级翻页失败原地重试 3 次）→ 连续读 N 字节 →
+ *   写数据格。整块失败按子段补救（每子段最多 1+retry 次，成功即停），
  *   成功子段真值保留、失败子段填 0，ok/valid 位图标明有效性。
- *   分类、过滤、沿用上帧、字段解析全部在前端。
+ *   全部指令跑完后在该份 A/B 的标志格（第 511 格）写 ok=1 + 帧号，
+ *   前端见标志才收，收完把自己读过的格清零。分类、过滤、绘制全在前端。
+ *
+ * 删除件（v4 → v5）：
+ *   - pcache 链解析缓存（128KB）——没有"上次的地址"，每次按指令现走
+ *   - kind=1 内核按人数组循环 ——几个人就是几条指令，内核不循环人
+ *   - BASE/ARRAY/PREV 三种起点 ——只剩一种指令：一条链 + 读 + 写格
+ *   - 内核私有任务表（d->jobs）——指令在池里，现取现用
+ *   - CMD_SET_JOBS ——前端写完任务区 release hdr.job_num 即生效
  *
  * 保留件：pin/unpin、双缓冲翻页、命令环、看门狗、mbox 探址、
- *   音量键触发绑定（trigger.c）、read_kbuf 读原语（core.c，不动）。
- * 删除件：esp_cfg/bone_cfg/entity/camera/ext/bone/name 全部游戏专用
- *   区与采样逻辑、factor 位变换（v4 数据不混淆）。
+ *   音量键触发绑定（trigger.c）、read_kbuf 读原语（core.c，不动）、
+ *   共享池按页拷贝（页不连续铁律）。
  */
 
 #include <linux/kernel.h>
@@ -37,14 +45,6 @@
 #define OPLUS_FRAME_SYNC_RATE_DEFAULT     60u
 #define OPLUS_FRAME_SYNC_RATE_MAX         165u
 #define OPLUS_FRAME_SYNC_WATCHDOG_MS      3000u
-/* 指针缓存每任务循环上限（覆盖 100 人场景；超出部分当帧重追不放缓存） */
-#define OPLUS_FRAME_SYNC_CACHE_ARR_MAX    128
-
-/* 链解析缓存：键 = 数组地址（数组重建即整体失效），无语义 */
-struct oplus_frame_sync_pcache {
-	u64 arr;	/* 缓存时数组地址（0 = 单次任务不缓存） */
-	u64 ptr;	/* 链解析结果 */
-};
 
 struct oplus_frame_sync_dev {
 	struct page **pages;
@@ -59,13 +59,6 @@ struct oplus_frame_sync_dev {
 	pid_t want_pid;
 
 	u64 base;			/* 模块基址（SET_PARAMS 下发） */
-
-	/* 任务表本地副本（SET_JOBS 时从 zone 拷入，采样用副本防前端并发改） */
-	struct oplus_frame_sync_job jobs[OPLUS_FRAME_SYNC_JOB_MAX];
-	u32 job_num;
-
-	/* 链解析缓存（lazy 申请：JOB_MAX × CACHE_ARR_MAX × 16B = 128KB） */
-	struct oplus_frame_sync_pcache *pcache;
 
 	u32 stage;
 	u32 rate;
@@ -219,11 +212,6 @@ static void oplus_frame_sync_shm_unpin(struct oplus_frame_sync_dev *d)
 		d->cm_mm = NULL;
 	}
 	d->cm_pid = 0;
-
-	if (d->pcache) {
-		kvfree(d->pcache);
-		d->pcache = NULL;
-	}
 }
 
 static int oplus_frame_sync_shm_pin(struct oplus_frame_sync_dev *d, pid_t customer_pid, u64 addr, u32 size)
@@ -301,44 +289,6 @@ static int oplus_frame_sync_shm_pin(struct oplus_frame_sync_dev *d, pid_t custom
 static void oplus_frame_sync_shm_reset_params(struct oplus_frame_sync_dev *d)
 {
 	d->base = 0;
-	memset(d->jobs, 0, sizeof(d->jobs));
-	d->job_num = 0;
-}
-
-/* 任务表合法性校验（配置错误整条拒绝，宁缺毋滥） */
-static bool oplus_frame_sync_job_valid(const struct oplus_frame_sync_job *j, u32 idx)
-{
-	u32 stride, s;
-
-	if (j->chain_len > OPLUS_FRAME_SYNC_JOB_CHAIN)
-		return false;
-	if (!j->read_len || j->read_len > OPLUS_FRAME_SYNC_SLOT_DATA)
-		return false;
-	if (j->slot_off + j->read_len > OPLUS_FRAME_SYNC_SLOT_DATA)
-		return false;
-	if (j->sub_count > OPLUS_FRAME_SYNC_JOB_SUB)
-		return false;
-	for (s = 0; s < j->sub_count; s++) {
-		if (j->sub_off[s] + j->sub_len[s] > j->read_len)
-			return false;
-	}
-	if (j->retry > OPLUS_FRAME_SYNC_JOB_RETRY_MAX)
-		return false;
-	stride = j->slot_stride ? j->slot_stride : 1;
-	if (j->slot_base >= OPLUS_FRAME_SYNC_SLOT_MAX)
-		return false;
-	if (j->kind == 1) {
-		if (j->arr_job >= idx)	/* 锚点必须是前置任务 */
-			return false;
-		if (!j->arr_max || j->arr_max > OPLUS_FRAME_SYNC_CACHE_ARR_MAX)
-			return false;
-		if (j->slot_base + j->arr_max * stride > OPLUS_FRAME_SYNC_SLOT_MAX)
-			return false;
-	} else {
-		if (j->src == JOB_SRC_PREV && j->src_job >= idx)
-			return false;
-	}
-	return true;
 }
 
 static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
@@ -378,12 +328,12 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 		break;
 
 	case OPLUS_FRAME_SYNC_CMD_SET_PARAMS:
-		/* v4 仅取模块基址（p0/p1 拼 64 位），数量/数组偏移由任务表决定 */
+		/* 仅取模块基址（p0/p1 拼 64 位），其余全部由任务区指令决定 */
 		d->base = ((u64)(u32)c->p1 << 32) | (u32)c->p0;
 		break;
 
 	case OPLUS_FRAME_SYNC_CMD_SET_FACTOR:
-		/* v4 数据不混淆，保留命令空转兼容旧前端 */
+		/* 数据不混淆，保留命令空转兼容旧前端 */
 		z->hdr.factor = c->p0 ? (u32)c->p0 : (u32)get_random_u32();
 		break;
 
@@ -405,30 +355,6 @@ static void oplus_frame_sync_shm_exec(struct oplus_frame_sync_dev *d,
 		d->want_pid = 0;
 		d->want_detach = true;
 		break;
-
-	case OPLUS_FRAME_SYNC_CMD_SET_JOBS: {
-		/* 前端已写好 zone.jobs[0..hdr.job_num)。共享池页不保证物理连续，
-		 * 必须逐条按页拷出到临时 job 再校验，禁止 memcpy(d->jobs, z->jobs)。 */
-		u32 want = (u32)z->hdr.job_num, n = 0, i;
-
-		if (want > OPLUS_FRAME_SYNC_JOB_MAX)
-			want = OPLUS_FRAME_SYNC_JOB_MAX;
-		for (i = 0; i < want; i++) {
-			struct oplus_frame_sync_job tmp;
-
-			if (oplus_frame_sync_shm_copy_out(d,
-					offsetof(struct oplus_frame_sync_zone, jobs) +
-					(size_t)i * sizeof(tmp),
-					&tmp, sizeof(tmp)) != 0)
-				break;
-			if (!oplus_frame_sync_job_valid(&tmp, i))
-				break;
-			d->jobs[i] = tmp;
-			n = i + 1;	/* 前缀合法条数（允许尾部留空） */
-		}
-		d->job_num = n;
-		break;
-	}
 
 	case OPLUS_FRAME_SYNC_CMD_RESET:
 		d->want_pid = 0;
@@ -467,7 +393,7 @@ static void oplus_frame_sync_shm_drain(struct oplus_frame_sync_dev *d,
 }
 
 /* ------------------------------------------------------------------ *
- * 任务执行器（通用读取引擎，零游戏语义）
+ * 指令执行器（通用读取引擎，零游戏语义）
  * ------------------------------------------------------------------ */
 static inline u64 oplus_frame_sync_shm_rd64(struct mm_struct *mm, u64 a)
 {
@@ -477,93 +403,64 @@ static inline u64 oplus_frame_sync_shm_rd64(struct mm_struct *mm, u64 a)
 	return v;
 }
 
-/* 解析单次任务起点（BASE / PREV） */
-static u64 oplus_frame_sync_job_start_once(struct oplus_frame_sync_dev *d,
-					   const struct oplus_frame_sync_job *j,
-					   u32 buf)
+/* 指令合法性校验（配置错误整条拒绝，宁缺毋滥） */
+static bool oplus_frame_sync_job_valid(const struct oplus_frame_sync_job *j)
 {
-	if (j->src == JOB_SRC_BASE)
-		return d->base + j->base_off;
+	u32 s;
 
-	if (j->src == JOB_SRC_PREV) {
-		const struct oplus_frame_sync_job *ref = &d->jobs[j->src_job];
-		struct oplus_frame_sync_slot *ps =
-			oplus_frame_sync_shm_slot(d, buf, ref->slot_base);
-		u64 p = 0;
-
-		if (ps && ps->ok) {
-			memcpy(&p, ps->data, sizeof(p));
-			return p;
-		}
-		return 0;
+	if (j->chain_len > OPLUS_FRAME_SYNC_JOB_CHAIN)
+		return false;
+	if (!j->read_len || j->read_len > OPLUS_FRAME_SYNC_SLOT_DATA)
+		return false;
+	if (j->slot >= OPLUS_FRAME_SYNC_SLOT_FLAG)
+		return false;	/* 标志格内核专用，指令不许写 */
+	if (j->slot_off + j->read_len > OPLUS_FRAME_SYNC_SLOT_DATA)
+		return false;
+	if (j->sub_count > OPLUS_FRAME_SYNC_JOB_SUB)
+		return false;
+	for (s = 0; s < j->sub_count; s++) {
+		if (!j->sub_len[s])
+			return false;
+		if (j->sub_off[s] + j->sub_len[s] > j->read_len)
+			return false;
 	}
-	return 0;
+	if (j->retry > OPLUS_FRAME_SYNC_JOB_RETRY_MAX)
+		return false;
+	return true;
 }
 
-/* 解析循环任务第 i 项起点（ARRAY / PREV） */
-static u64 oplus_frame_sync_job_start_arr(struct oplus_frame_sync_dev *d,
-					  const struct oplus_frame_sync_job *j,
-					  u32 buf, u64 arr, u32 i)
+/* 走链失败：本格数据区清零 + ok=0（没有就没有，不沿用旧值） */
+static void oplus_frame_sync_job_fail(const struct oplus_frame_sync_job *j,
+				      struct oplus_frame_sync_slot *s)
 {
-	if (j->src == JOB_SRC_ARRAY) {
-		u32 st = j->arr_stride ? j->arr_stride : 8;
-
-		return oplus_frame_sync_shm_rd64(d->tg_mm, arr + (u64)i * st);
+	memset(s->data + j->slot_off, 0, j->read_len);
+	if (!(j->flags & JOB_FLAG_NO_OK)) {
+		smp_wmb();	/* 先清数据，再发布失败头 */
+		s->ok = 0;
+		s->len = 0;
+		s->valid = 0;
 	}
-
-	if (j->src == JOB_SRC_PREV) {
-		const struct oplus_frame_sync_job *ref = &d->jobs[j->src_job];
-		u32 rst = ref->slot_stride ? ref->slot_stride : 1;
-		struct oplus_frame_sync_slot *ps =
-			oplus_frame_sync_shm_slot(d, buf, ref->slot_base + i * rst);
-		u64 p = 0;
-
-		if (ps && ps->ok) {
-			memcpy(&p, ps->data, sizeof(p));
-			return p;
-		}
-		return 0;
-	}
-	return 0;
 }
 
-/* 走指针链；循环任务用缓存（键=数组地址，数组重建即失效） */
+/* 走指针链：ptr = *(u64*)(ptr + chain[k])，每级失败原地重试 3 次 */
 static u64 oplus_frame_sync_job_walk(struct oplus_frame_sync_dev *d,
-				     const struct oplus_frame_sync_job *j,
-				     u32 jid, u32 idx, u64 start, u64 arr)
+				     const struct oplus_frame_sync_job *j)
 {
-	struct oplus_frame_sync_pcache *c;
-	u64 ptr = start;
-	u32 k;
+	u64 ptr = d->base;
+	u32 k, t;
 
-	if (!start)
-		return 0;
-	if (!arr)
-		goto no_cache;	/* 单次任务不缓存（锚点/相机每帧重追） */
-
-	if (!d->pcache) {
-		d->pcache = kvzalloc(sizeof(*d->pcache) * OPLUS_FRAME_SYNC_JOB_MAX *
-				     OPLUS_FRAME_SYNC_CACHE_ARR_MAX, GFP_KERNEL);
-		if (!d->pcache)
-			goto no_cache;
-	}
-	if (idx >= OPLUS_FRAME_SYNC_CACHE_ARR_MAX)
-		goto no_cache;
-
-	c = &d->pcache[jid * OPLUS_FRAME_SYNC_CACHE_ARR_MAX + idx];
-	if (c->ptr && c->arr == arr)
-		return c->ptr;
-
-no_cache:
 	for (k = 0; k < j->chain_len; k++) {
-		ptr = oplus_frame_sync_shm_rd64(d->tg_mm, ptr + j->chain[k]);
-		if (!ptr)
+		u64 addr = ptr + j->chain[k];
+		u64 v = 0;
+
+		for (t = 0; t < OPLUS_FRAME_SYNC_WALK_RETRY; t++) {
+			v = oplus_frame_sync_shm_rd64(d->tg_mm, addr);
+			if (v)
+				break;
+		}
+		if (!v)
 			return 0;
-	}
-	if (arr && d->pcache && idx < OPLUS_FRAME_SYNC_CACHE_ARR_MAX) {
-		c = &d->pcache[jid * OPLUS_FRAME_SYNC_CACHE_ARR_MAX + idx];
-		c->arr = arr;
-		c->ptr = ptr;
+		ptr = v;
 	}
 	return ptr;
 }
@@ -579,6 +476,7 @@ static void oplus_frame_sync_job_read(struct oplus_frame_sync_dev *d,
 	if (oplus_frame_sync_read_kbuf(d->tg_mm, addr, dst, j->read_len) ==
 	    (ssize_t)j->read_len) {
 		if (!(j->flags & JOB_FLAG_NO_OK)) {
+			smp_wmb();	/* 先写完数据，再发布成功头 */
 			s->ok = 1;
 			s->len = j->read_len;
 			s->valid = j->sub_count ? ((1u << j->sub_count) - 1u) : 0;
@@ -587,7 +485,9 @@ static void oplus_frame_sync_job_read(struct oplus_frame_sync_dev *d,
 	}
 
 	if (!j->sub_count) {
+		memset(dst, 0, j->read_len);
 		if (!(j->flags & JOB_FLAG_NO_OK)) {
+			smp_wmb();
 			s->ok = 0;
 			s->len = 0;
 			s->valid = 0;
@@ -611,75 +511,34 @@ static void oplus_frame_sync_job_read(struct oplus_frame_sync_dev *d,
 	}
 
 	if (!(j->flags & JOB_FLAG_NO_OK)) {
+		smp_wmb();
 		s->ok = 0;
 		s->len = j->read_len;
 		s->valid = valid;
 	}
 }
 
-static void oplus_frame_sync_job_run(struct oplus_frame_sync_dev *d, u32 jid, u32 buf)
+static void oplus_frame_sync_job_run(struct oplus_frame_sync_dev *d,
+				     const struct oplus_frame_sync_job *j,
+				     u32 buf)
 {
-	const struct oplus_frame_sync_job *j = &d->jobs[jid];
+	struct oplus_frame_sync_slot *s =
+		oplus_frame_sync_shm_slot(d, buf, j->slot);
+	u64 ptr;
 
-	if (j->kind == 1) {
-		struct oplus_frame_sync_slot *as = oplus_frame_sync_shm_slot(d, buf, j->arr_job);
-		u32 stride = j->slot_stride ? j->slot_stride : 1;
-		u64 arr = 0;
-		s32 cnt = 0;
-		u32 n, i;
-
-		if (as && as->ok) {
-			memcpy(&arr, as->data, sizeof(arr));
-			memcpy(&cnt, as->data + 8, sizeof(cnt));
-		}
-		if (!arr || cnt <= 0)
-			n = 0;
-		else
-			n = (u32)cnt > j->arr_max ? j->arr_max : (u32)cnt;
-
-		for (i = 0; i < j->arr_max; i++) {
-			struct oplus_frame_sync_slot *s =
-				oplus_frame_sync_shm_slot(d, buf, j->slot_base + i * stride);
-			u64 start, ptr;
-
-			if (!s)
-				break;
-			if (i >= n) {
-				s->ok = 0;
-				s->len = 0;
-				s->valid = 0;
-				continue;
-			}
-			start = oplus_frame_sync_job_start_arr(d, j, buf, arr, i);
-			ptr = oplus_frame_sync_job_walk(d, j, jid, i, start, arr);
-			if (!ptr) {
-				s->ok = 0;
-				s->len = 0;
-				s->valid = 0;
-				continue;
-			}
-			oplus_frame_sync_job_read(d, j, ptr + j->read_off, s);
-		}
+	if (!s)
+		return;
+	if (!d->base) {
+		oplus_frame_sync_job_fail(j, s);
 		return;
 	}
 
-	/* 单次任务 */
-	{
-		u64 start = oplus_frame_sync_job_start_once(d, j, buf);
-		u64 ptr = oplus_frame_sync_job_walk(d, j, jid, 0, start, 0);
-		struct oplus_frame_sync_slot *s =
-			oplus_frame_sync_shm_slot(d, buf, j->slot_base);
-
-		if (!s)
-			return;
-		if (!ptr) {
-			s->ok = 0;
-			s->len = 0;
-			s->valid = 0;
-			return;
-		}
-		oplus_frame_sync_job_read(d, j, ptr + j->read_off, s);
+	ptr = oplus_frame_sync_job_walk(d, j);
+	if (!ptr) {
+		oplus_frame_sync_job_fail(j, s);
+		return;
 	}
+	oplus_frame_sync_job_read(d, j, ptr + j->read_off, s);
 }
 
 /* ------------------------------------------------------------------ *
@@ -716,22 +575,59 @@ static void oplus_frame_sync_shm_sample(struct oplus_frame_sync_dev *d,
 					struct oplus_frame_sync_zone *z)
 {
 	u32 buf = z->hdr.buf_idx ? 0 : 1;	/* 只写 standby 区 */
-	u32 jid;
+	u32 job_num, jid;
 
 	if (!d->tg_mm)
 		return;
-	if (!d->job_num)
-		return;
 
-	for (jid = 0; jid < d->job_num; jid++)
-		oplus_frame_sync_job_run(d, jid, buf);
+	/* 任务区现取现执行：前端写 jobs 后 release job_num，内核 acquire 现读。
+	 * 无本地副本——任务顺序、内容、条数全部由前端决定。 */
+	job_num = smp_load_acquire(&z->hdr.job_num);
+	if (!job_num)
+		return;
+	if (job_num > OPLUS_FRAME_SYNC_JOB_MAX)
+		job_num = OPLUS_FRAME_SYNC_JOB_MAX;
+
+	for (jid = 0; jid < job_num; jid++) {
+		struct oplus_frame_sync_job j;
+
+		/* 共享池页不保证物理连续：逐条按页拷出，禁止跨页整块 memcpy */
+		if (oplus_frame_sync_shm_copy_out(d,
+				offsetof(struct oplus_frame_sync_zone, jobs) +
+				(size_t)jid * sizeof(j),
+				&j, sizeof(j)) != 0) {
+			d->errors++;
+			break;
+		}
+		if (!oplus_frame_sync_job_valid(&j)) {
+			d->errors++;
+			continue;
+		}
+		oplus_frame_sync_job_run(d, &j, buf);
+	}
 
 	if (z->hdr.flag & OPLUS_FRAME_SYNC_FLAG_MBOX)
 		oplus_frame_sync_shm_service_mbox(d);
 
-	/* 原子翻页：数据写完再 release 发布索引；frame_num 同步发布帧计数 */
-	smp_store_release(&z->hdr.buf_idx, buf);
+	/* 收尾：先写标志格（本份最后一格），再 release 翻页发布。
+	 * 前端只在标志格 ok=1 且帧号匹配时才收这一份。 */
 	d->frames++;
+	{
+		struct oplus_frame_sync_slot *f =
+			oplus_frame_sync_shm_slot(d, buf, OPLUS_FRAME_SYNC_SLOT_FLAG);
+
+		if (f) {
+			u32 *fd = (u32 *)f->data;
+
+			fd[0] = d->frames;
+			fd[1] = OPLUS_FRAME_SYNC_FLAG_MAGIC;
+			smp_wmb();	/* 先写完帧号，再发布标志头 */
+			f->len = 8;
+			f->valid = 0;
+			f->ok = 1;
+		}
+	}
+	smp_store_release(&z->hdr.buf_idx, buf);
 	smp_store_release(&z->hdr.frame_num, d->frames);
 }
 
@@ -874,7 +770,7 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	}
 
 	/* 初始化共享池：逐页清零（池页物理不连续，不能一次 memset 整个 zone）。
-	 * v4：factor 恒 0（数据不再混淆），flag 默认只开 mbox 服务。 */
+	 * factor 恒 0（数据不混淆），flag 默认只开 mbox 服务。 */
 	{
 		size_t left = sizeof(*z);
 		size_t done = 0;
@@ -889,7 +785,6 @@ int oplus_frame_sync_shm_attach(pid_t pid, u64 addr, u32 size)
 	}
 	z->hdr.cmd_num = 0;
 	z->hdr.stage = OPLUS_FRAME_SYNC_STAGE_IDLE;
-	z->hdr.entity_num = 0;
 	z->hdr.buf_idx = 0;
 	z->hdr.factor = 0;
 	z->hdr.flag = OPLUS_FRAME_SYNC_FLAG_MBOX;
