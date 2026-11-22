@@ -110,7 +110,7 @@ static int oplus_frame_sync_locate_and_attach(void)
 		return -ESRCH;
 	}
 
-	/* ③ 找 282624B(69页) 匿名可写 VMA = 池候选（6.6 用 maple tree 遍历）；
+	/* ③ 找 MAP_SIZE(73页) 匿名可写 VMA = 池候选（6.6 用 maple tree 遍历）；
 	 *    先收集全部尺寸匹配候选，解锁后再逐个用 access_process_vm 校验归属魔数
 	 *    （工单_共享池误绑修复_v1.md D2）。不能持 mmap_read_lock 时调
 	 *    access_process_vm（内部会再拿 mmap 锁，会死锁）。 */
