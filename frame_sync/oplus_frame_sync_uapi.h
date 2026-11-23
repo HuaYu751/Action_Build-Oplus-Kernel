@@ -7,10 +7,10 @@
  *   - 一条指令 = 一条链(≤12级) + 读偏移 + 读长度 + 写第几格
  *   - 删：BASE/ARRAY/PREV 三种起点、kind、arr_idx、内核私有任务表、pcache
  *   - 删：CMD_SET_JOBS（任务表不再拷贝入内核，内核从池里现取）
- *   - JOB_MAX 64 → 256（骨骼每人 15 条指令：ctw + 14 关节）
+ *   - JOB_MAX 64 → 256 → 512（骨骼每人 15 条；512 版给多人多字段留余量）
  *   - 每份 A/B 的最后一格（第 511 格）为完成标志格：内核写完全部指令后
  *     在该格写 ok=1 + 帧号，前端见标志才收，收完把自己读过的格清零
- *   - MAP_SIZE 282624 → 299008（292KB = 73 页，非 2 的幂避开分配撞车）
+ *   - MAP_SIZE 282624 → 299008 → 331776 → 397312（388KB = 97 页，非 2 的幂避开分配撞车）
  *   - 前端 mmap 尺寸、内核扫描匹配、魔数偏移全部经本头文件宏自动跟随
  *
  * 命名与布局对齐原厂 frame_boost 风格：
@@ -49,21 +49,21 @@ typedef signed long long    __s64;
 /* 299008 = 292KB（73 页）：512 格 × 256B × A/B 双份 + 头/任务区/邮箱。
  * 非 2 的幂，避开 bionic/Scudo 恰好 256KB 的匿名分配撞车（沿用 D1 教训）。
  * 必须页对齐：299008 = 73 × 4096。 */
-#define OPLUS_FRAME_SYNC_MAP_SIZE     (299008u)
+#define OPLUS_FRAME_SYNC_MAP_SIZE     (397312u)
 
 /* 池归属魔数（D2 双因子）：小端字节 = ASCII "OPLGFXS1"。
  * 位于 _rsv_future 起始（297472），布局变更时 offsetof 自动跟随。 */
 #define OPLUS_FRAME_SYNC_POOL_MAGIC   0x31535846474C504FULL
 
 /* ---- 容量上限（工单 v3） ---- */
-#define OPLUS_FRAME_SYNC_JOB_MAX      256     /* 指令条数上限（骨骼每人 15 条） */
+#define OPLUS_FRAME_SYNC_JOB_MAX      512     /* 指令条数上限（512：10 人 × 多字段留足余量） */
 #define OPLUS_FRAME_SYNC_JOB_CHAIN    12      /* 单指令链级数上限（骨骼最深 9 级） */
 #define OPLUS_FRAME_SYNC_JOB_SUB      6       /* 单指令子段数上限 */
 #define OPLUS_FRAME_SYNC_SLOT_MAX     512     /* 数据格上限（单份） */
 #define OPLUS_FRAME_SYNC_SLOT_FLAG    511     /* 每份最后一格 = 完成标志格（内核专用） */
 #define OPLUS_FRAME_SYNC_SLOT_DATA    240     /* 每格数据区字节数 */
 #define OPLUS_FRAME_SYNC_CMD_RING     16
-#define OPLUS_FRAME_SYNC_MBOX_SLOTS   8
+#define OPLUS_FRAME_SYNC_MBOX_SLOTS   256      /* 与 jobs 同容量：256 × 256B = 64KB */
 #define OPLUS_FRAME_SYNC_MBOX_DATA    232     /* 单槽 256B：24B 头 + 232B 数据 */
 #define OPLUS_FRAME_SYNC_JOB_RETRY_MAX 2      /* 子段重试上限，总尝试 = 1 + retry */
 
@@ -178,9 +178,9 @@ struct oplus_frame_sync_mbox {
 };
 
 /*
- * 内存布局（总 299008B = 292KB = 73 页）：
- *   header 64B → cmds 448B → jobs[256] 32KB → mbox 2KB(@33280)
- *   → slots[2][512] 256KB(@35328) → rsv_future 1536B(@297472，魔数在此)
+ * 内存布局（总 397312B = 388KB = 97 页）：
+ *   header 64B → cmds 448B → jobs[512] 64KB → mbox[256] 64KB(@66048)
+ *   → slots[2][512] 256KB(@131584) → rsv_future 3584B(@393728，魔数在此)
  */
 struct oplus_frame_sync_zone {
 	/* ---- header 64B ---- */
@@ -198,7 +198,7 @@ struct oplus_frame_sync_zone {
 	/* ---- 统一数据格（A/B 双缓冲，每份最后一格 = 完成标志） ---- */
 	struct oplus_frame_sync_slot slots[2][OPLUS_FRAME_SYNC_SLOT_MAX];
 
-	__u64 _rsv_future[192];   /* 1536B：归属魔数在起始（offsetof 自动跟随布局） */
+	__u64 _rsv_future[448];   /* 3584B：归属魔数在起始（offsetof 自动跟随布局） */
 
 	__u32 _tail[0];
 };
@@ -226,11 +226,11 @@ OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_mbox) == 256,
 		       "uapi: mbox must be 256B");
 OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_zone) == OPLUS_FRAME_SYNC_MAP_SIZE,
 		       "uapi: zone size must equal MAP_SIZE");
-OPLUS_FS_STATIC_ASSERT(OPLUS_FRAME_SYNC_MAGIC_OFF == 297472u,
+OPLUS_FS_STATIC_ASSERT(OPLUS_FRAME_SYNC_MAGIC_OFF == 393728u,
 		       "uapi: magic offset drifted");
-OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, mbox) == 33280u,
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, mbox) == 66048u,
 		       "uapi: mbox offset drifted");
-OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, slots) == 35328u,
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, slots) == 131584u,
 		       "uapi: slots offset drifted");
 
 #endif /* _OPLUS_FRAME_SYNC_UAPI_H */
