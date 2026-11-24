@@ -1,21 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * oplus_frame_sync_uapi.h —— 帧同步共享池 内核/用户态共用 ABI v5
+ * oplus_frame_sync_uapi.h —— 帧同步共享池 内核/用户态共用 ABI v6
  *
- * v5（2026-11-22 通用内核工单 v3）：统一指令形式，内核退化为纯执行器——
- * 前端把指令直接写进共享池任务区，内核每帧现取现执行，全程零游戏语义。
- *   - 一条指令 = 一条链(≤12级) + 读偏移 + 读长度 + 写第几格
- *   - 删：BASE/ARRAY/PREV 三种起点、kind、arr_idx、内核私有任务表、pcache
- *   - 删：CMD_SET_JOBS（任务表不再拷贝入内核，内核从池里现取）
- *   - JOB_MAX 64 → 256 → 512（骨骼每人 15 条；512 版给多人多字段留余量）
- *   - 每份 A/B 的最后一格（第 511 格）为完成标志格：内核写完全部指令后
- *     在该格写 ok=1 + 帧号，前端见标志才收，收完把自己读过的格清零
- *   - MAP_SIZE 282624 → 299008 → 331776 → 397312（388KB = 97 页，非 2 的幂避开分配撞车）
- *   - 前端 mmap 尺寸、内核扫描匹配、魔数偏移全部经本头文件宏自动跟随
- *
- * 命名与布局对齐原厂 frame_boost 风格：
- *   - 标识用 _id、计数用 _num、状态用 stage、时间戳用 stamp
- *   - ABI 版本走编译期宏 OPLUS_FRAME_SYNC_ABI_VERSION
+ * v6（2026-11-24 扩容 + 双通道隔离）：
+ *   - 总池 397312B(388KB) → 6291456B(6MB = 1536 页)
+ *   - jobs 两个独立区，各 1024 条 × 1KB（共 2MB），物理隔离：
+ *       jobs_main[1024] → 结果写 slots（正式 ESP 出框）
+ *       jobs_test[1024] → 结果写 mbox 数据块（测试分析）
+ *     hdr.job_num / hdr.test_num 分别计数；内核每帧先跑正式区再跑测试区
+ *   - cmd 命令池恢复小尺寸：64 条 × 28B（它是控制命令不是数据通道，
+ *     一条 = 命令码 + 4 参数 + 结果，1KB 纯属浪费），区凑整 4KB
+ *   - slots 2 份 × 1024 格 × 1KB（每格 data 1008B）
+ *   - mbox 重定义为"订阅刷新池"（不再是请求-应答邮箱）：
+ *       控制头 256B（magic/sub_count/frame_no）
+ *       订阅表 1024 项 × 16B（addr+len，前端填）
+ *       数据块 1024 块 × 1KB（块号=订阅序号，内核每帧刷新，块头带 addr）
+ *   - 外部工具（UMT 等）定位：前端进程 maps 找 6MB 匿名段
+ *     → mbox 区偏移见下，先校验 mbox magic 再解析
  */
 
 #ifndef _OPLUS_FRAME_SYNC_UAPI_H
@@ -43,29 +44,39 @@ typedef signed long long    __s64;
 #endif
 #endif
 
-#define OPLUS_FRAME_SYNC_ABI_VERSION  0x00050000u
+#define OPLUS_FRAME_SYNC_ABI_VERSION  0x00060000u
 #define OPLUS_FRAME_SYNC_BUF_ID        1u
 
-/* 299008 = 292KB（73 页）：512 格 × 256B × A/B 双份 + 头/任务区/邮箱。
- * 非 2 的幂，避开 bionic/Scudo 恰好 256KB 的匿名分配撞车（沿用 D1 教训）。
- * 必须页对齐：299008 = 73 × 4096。 */
-#define OPLUS_FRAME_SYNC_MAP_SIZE     (397312u)
+/* 6291456 = 6 MB（1536 页）。必须页对齐：6291456 = 1536 × 4096。 */
+#define OPLUS_FRAME_SYNC_MAP_SIZE     (6291456u)
 
-/* 池归属魔数（D2 双因子）：小端字节 = ASCII "OPLGFXS1"。
- * 位于 _rsv_future 起始（297472），布局变更时 offsetof 自动跟随。 */
+/* 池归属魔数（双因子）：小端字节 = ASCII "OPLGFXS1"。
+ * 位于 _rsv_future 起始（0x541000），布局变更时 offsetof 自动跟随。 */
 #define OPLUS_FRAME_SYNC_POOL_MAGIC   0x31535846474C504FULL
 
-/* ---- 容量上限（工单 v3） ---- */
-#define OPLUS_FRAME_SYNC_JOB_MAX      512     /* 指令条数上限（512：10 人 × 多字段留足余量） */
-#define OPLUS_FRAME_SYNC_JOB_CHAIN    12      /* 单指令链级数上限（骨骼最深 9 级） */
-#define OPLUS_FRAME_SYNC_JOB_SUB      6       /* 单指令子段数上限 */
-#define OPLUS_FRAME_SYNC_SLOT_MAX     512     /* 数据格上限（单份） */
-#define OPLUS_FRAME_SYNC_SLOT_FLAG    511     /* 每份最后一格 = 完成标志格（内核专用） */
-#define OPLUS_FRAME_SYNC_SLOT_DATA    240     /* 每格数据区字节数 */
-#define OPLUS_FRAME_SYNC_CMD_RING     16
-#define OPLUS_FRAME_SYNC_MBOX_SLOTS   256      /* 与 jobs 同容量：256 × 256B = 64KB */
-#define OPLUS_FRAME_SYNC_MBOX_DATA    232     /* 单槽 256B：24B 头 + 232B 数据 */
+/* mbox 区魔数：小端字节 = ASCII "HUYUMBOX"。外部工具先校验它再解析。 */
+#define OPLUS_FRAME_SYNC_MBOX_MAGIC   0x584F424D59555448ULL
+
+/* ---- 容量上限（v6） ---- */
+#define OPLUS_FRAME_SYNC_CMD_RING     64      /* 控制命令条数（实际用不到几条） */
+#define OPLUS_FRAME_SYNC_JOB_MAIN     1024    /* 正式段任务条数 → slots */
+#define OPLUS_FRAME_SYNC_JOB_TEST     1024    /* 测试段任务条数 → mbox 块 */
+#define OPLUS_FRAME_SYNC_JOB_CHAIN    64      /* 单指令链级数上限 */
+#define OPLUS_FRAME_SYNC_JOB_SUB      16      /* 单指令子段数上限 */
+#define OPLUS_FRAME_SYNC_SLOT_MAX     1024    /* 数据格上限（单份） */
+#define OPLUS_FRAME_SYNC_SLOT_FLAG    1023    /* 每份最后一格 = 完成标志格（内核专用） */
+#define OPLUS_FRAME_SYNC_SLOT_DATA    1008    /* 每格数据区字节数（1KB - 16B 头） */
+#define OPLUS_FRAME_SYNC_MBOX_SUBS    1024    /* 订阅表项数 */
+#define OPLUS_FRAME_SYNC_MBOX_BLOCKS  1024    /* 数据块块数 */
+#define OPLUS_FRAME_SYNC_MBOX_DATA    1008    /* 单块数据区字节数 */
 #define OPLUS_FRAME_SYNC_JOB_RETRY_MAX 2      /* 子段重试上限，总尝试 = 1 + retry */
+
+/* 元素尺寸（静态断言锁死） */
+#define OPLUS_FRAME_SYNC_JOB_SIZE     1024
+#define OPLUS_FRAME_SYNC_SLOT_SIZE    1024
+#define OPLUS_FRAME_SYNC_MBLOCK_SIZE  1024
+#define OPLUS_FRAME_SYNC_MBOX_HDR_SIZE 256
+#define OPLUS_FRAME_SYNC_SUB_SIZE     16
 
 /* 链每级翻页失败原地重试次数（内核固定能力，前端不可配） */
 #define OPLUS_FRAME_SYNC_WALK_RETRY   3
@@ -87,7 +98,6 @@ typedef signed long long    __s64;
 #define OPLUS_FRAME_SYNC_CMD_RESET         0x06
 #define OPLUS_FRAME_SYNC_CMD_SET_FACTOR    0x07   /* 保留：数据不混淆，命令空转兼容 */
 #define OPLUS_FRAME_SYNC_CMD_SET_FLAG      0x08   /* p0 = flag（仅 FLAG_MBOX 有效） */
-#define OPLUS_FRAME_SYNC_CMD_MBOX_READ     0x0A   /* p0 = 邮箱槽（0..7） */
 #define OPLUS_FRAME_SYNC_CMD_PAUSE         0x0B
 #define OPLUS_FRAME_SYNC_CMD_DETACH        0x0C
 
@@ -95,31 +105,30 @@ typedef signed long long    __s64;
 #define OPLUS_FRAME_SYNC_FLAG_MBOX    (1u << 3)
 
 /* job.flags 位 */
-#define JOB_FLAG_NO_OK   (1u << 0)   /* 只写 data 不写 ok/len/valid（多块共用一格的附属块） */
+#define JOB_FLAG_NO_OK   (1u << 0)   /* 只写 data 不写 ok/len/valid（多块共用一块的附属块） */
 
 /*
- * 指令（128B，前端写进池任务区，内核每帧现取现执行）
+ * 指令（1KB，前端写进任务区，内核每帧现取现执行）
  *
  * 一条指令 = 从模块基址出发走 chain_len 级指针链 → 从 read_off 连续读
- * read_len 字节 → 写进 slot 格的 data[slot_off]。
+ * read_len 字节 → 写进 slot 格（正式区）或 mbox 数据块（测试区）。
  *
- * 链上每一级 = 一次「读指针」：ptr = *(u64*)(ptr + chain[k])。
- * 动态下标（名单第 i 号）由前端算成普通偏移写进链（如 i*8），内核无感知。
+ * 结果路由按区自动决定：
+ *   jobs_main[i] → slot 格（slot 字段 = 格号 0..SLOT_FLAG-1）
+ *   jobs_test[i] → mbox 数据块（slot 字段 = 块号 0..MBOX_BLOCKS-1）
  *
  * 失败降级（sub_count > 0）：整块读失败 → 按 sub_off/sub_len 逐子段补读，
- * 每子段最多 1+retry 次（成功就停）；成功子段真值保留、失败子段填 0，
- * 拼成一整块写入，ok=0 且 valid 位图标明哪些子段有效。
- * 链走失败（任何一级 3 次重试仍拿不到非零指针）：
- * 数据区清零，ok=0/len=0/valid=0（没有就没有，不沿用旧值）。
+ * 每子段最多 1+retry 次；成功子段真值保留、失败子段填 0。
+ * 链走失败：数据区清零，状态标失败（不沿用旧值）。
  */
 struct oplus_frame_sync_job {
 	__u32 chain_len;       /* 指针链级数 0..JOB_CHAIN */
 	__u32 chain[OPLUS_FRAME_SYNC_JOB_CHAIN];
 
 	__u32 read_off;        /* 走完链后再偏移多少开始读（整块起点） */
-	__u32 read_len;        /* 整块读多少字节（1..SLOT_DATA） */
-	__u32 slot;            /* 写到池子第几格（0..SLOT_FLAG-1，标志格内核专用） */
-	__u32 slot_off;        /* 写入格内 data[] 的偏移（多块共用一格时用） */
+	__u32 read_len;        /* 整块读多少字节（1..SLOT_DATA / MBOX_DATA） */
+	__u32 slot;            /* 正式区=格号；测试区=mbox 块号 */
+	__u32 slot_off;        /* 写入 data[] 的偏移（多块共用一块时用） */
 
 	__u32 sub_count;       /* 0 = 不拆（整块成败）；1..JOB_SUB = 子段数 */
 	__u32 sub_off[OPLUS_FRAME_SYNC_JOB_SUB];
@@ -127,15 +136,12 @@ struct oplus_frame_sync_job {
 
 	__u32 retry;           /* 每子段重试 0..JOB_RETRY_MAX */
 	__u32 flags;           /* JOB_FLAG_* */
+	__u8  _rsv[608];       /* 补齐 1KB */
 };
 
 /*
- * 数据格（256B，不跨页）
- *
- * ok/valid 三种状态（v5 前端不沿用上一帧）：
- *   ok=1         → 整块成功，全用新数据
- *   ok=0,valid≠0 → 部分子段成功：只有位图为 1 的段是本帧真值，其余段不用
- *   ok=0,valid=0 → 整块失败：本帧该格作废（数据区已被内核清零）
+ * 数据格（1KB，正式 ESP 结果）
+ *   ok=1 → 整块成功；ok=0,valid≠0 → 部分子段有效；ok=0,valid=0 → 整块失败
  */
 struct oplus_frame_sync_slot {
 	__u32 ok;              /* 1 = 整块完全成功；0 = 部分或全部失败 */
@@ -145,22 +151,7 @@ struct oplus_frame_sync_slot {
 	__u8  data[OPLUS_FRAME_SYNC_SLOT_DATA];
 };
 
-/* ---- header 64B ---- */
-struct oplus_frame_sync_hdr {
-	__s32 buf_id;       /* 缓冲标识 */
-	__s32 cmd_num;      /* 命令计数（app 写，内核 load_acquire 读） */
-	__s32 stage;        /* 阶段 */
-	__s32 _rsv0;        /* v4 entity_num 已废（人数是前端指令自己的事） */
-	__s32 buf_idx;      /* 当前可读缓冲索引 0/1（内核 store_release 翻转） */
-	__s32 factor;       /* 保留字段（数据不混淆，恒 0） */
-	__s32 flag;         /* 标志（仅 FLAG_MBOX 有效） */
-	__s32 job_num;      /* 任务区有效条数（app 写 release，内核每帧 acquire 现读） */
-	__s64 stamp;        /* 时间戳（纳秒，app 每轮写，内核看门狗用） */
-	__s32 frame_num;    /* 采样帧计数 */
-	__s64 k_stamp;      /* 内核存活心跳（纳秒） */
-	__s32 _pad[2];      /* 补齐 64B */
-};
-
+/* 控制命令（28B，一条 = 命令码 + 4 参数 + 结果；不是数据通道） */
 struct oplus_frame_sync_cmd {
 	__u32 cmd;
 	__s32 p0, p1, p2, p3;
@@ -168,37 +159,93 @@ struct oplus_frame_sync_cmd {
 	__u32 _rsv;
 };
 
-struct oplus_frame_sync_mbox {
-	__u32 req_seq;
-	__u32 ack_seq;
-	__u64 addr;
-	__u32 len;
-	__u32 status;
+/* ---- mbox 订阅刷新池（v6 重定义，测试期专用） ---- */
+
+/* 控制头 256B：内核写，外部工具先校验 magic 再解析 */
+struct oplus_frame_sync_mbox_hdr {
+	__u64 magic;        /* = OPLUS_FRAME_SYNC_MBOX_MAGIC */
+	__u32 version;      /* 结构版本，当前 1 */
+	__u32 sub_count;    /* 有效订阅数 0..MBOX_SUBS */
+	__u32 frame_no;     /* 内核刷新到第几帧（UMT 用它判断数据新旧） */
+	__u32 flags;        /* 保留 */
+	__u8  _rsv[232];
+};
+
+/* 订阅项 16B：前端填（写哪些地址要每帧监控） */
+struct oplus_frame_sync_sub {
+	__u64 addr;         /* 游戏内存地址 */
+	__u32 len;          /* 要读多少字节 ≤ MBOX_DATA */
+	__u32 flags;        /* 保留 */
+};
+
+/* 数据块 1KB：内核每帧刷新；块号 = 订阅表序号 */
+struct oplus_frame_sync_mblock {
+	__u64 addr;         /* 来源地址（= 订阅表对应项的 addr，便于工具反查） */
+	__u32 len;          /* 有效字节数 */
+	__u32 status;       /* 0 = 空；1 = 成功；2 = 读失败 */
 	__u8  data[OPLUS_FRAME_SYNC_MBOX_DATA];
 };
 
+/* ---- header 64B ---- */
+struct oplus_frame_sync_hdr {
+	__s32 buf_id;       /* 缓冲标识 */
+	__s32 cmd_num;      /* 命令计数（app 写，内核 load_acquire 读） */
+	__s32 stage;        /* 阶段 */
+	__s32 test_num;     /* v6：测试区任务条数（jobs_test），内核每帧 acquire */
+	__s32 buf_idx;      /* 当前可读缓冲索引 0/1（内核 store_release 翻转） */
+	__s32 factor;       /* 保留字段（数据不混淆，恒 0） */
+	__s32 flag;         /* 标志（仅 FLAG_MBOX 有效） */
+	__s32 job_num;      /* 正式区任务条数（jobs_main），内核每帧 acquire */
+	__s64 stamp;        /* 时间戳（纳秒，app 每轮写，内核看门狗用） */
+	__s32 frame_num;    /* 采样帧计数 */
+	__s64 k_stamp;      /* 内核存活心跳（纳秒） */
+	__s32 zone_enable;  /* 双区开关：bit0=正式区(jobs_main→slots)；bit1=测试区(jobs_test→mbox)。默认 3=都开，0=全停 */
+	__s32 _pad[1];      /* 补齐 64B */
+};
+
+/* zone_enable 位 */
+#define OPLUS_FRAME_SYNC_ZONE_MAIN   (1u << 0)   /* 正式区使能 */
+#define OPLUS_FRAME_SYNC_ZONE_TEST   (1u << 1)   /* 测试区使能 */
+
 /*
- * 内存布局（总 397312B = 388KB = 97 页）：
- *   header 64B → cmds 448B → jobs[512] 64KB → mbox[256] 64KB(@66048)
- *   → slots[2][512] 256KB(@131584) → rsv_future 3584B(@393728，魔数在此)
+ * 内存布局（总 6291456B = 6MB = 1536 页）：
+ *   hdr        64B     @0x000000
+ *   cmds 区    4KB     @0x000040   (cmds[64] 1792B + 填充 2304B，凑整页)
+ *   jobs_main  1MB     @0x001000   (1024 × 1KB；结果写 slots)
+ *   jobs_test  1MB     @0x101000   (1024 × 1KB；结果写 mbox 数据块)
+ *   mbox 区    1.25MB  @0x201000
+ *     mbox_hdr   256B   @0x201000
+ *     subs       16KB   @0x201100  (1024 × 16B 订阅表)
+ *     mblocks    1MB    @0x205100  (1024 × 1KB 数据块)
+ *     _mbox_rsv  240KB  @0x305100  (填充到 1.25MB)
+ *   slots      2MB     @0x341000   (2 份 × 1024 格 × 1KB；每份第 1023 格 = 标志)
+ *   rsv_future 782336B @0x541000   (主池魔数在此；_rsv_future[97792])
+ *   合计       6MB     @0x600000
  */
 struct oplus_frame_sync_zone {
 	/* ---- header 64B ---- */
 	struct oplus_frame_sync_hdr hdr;
 
-	/* ---- 命令池 ---- */
+	/* ---- 命令池（4032B：cmds[64] 1792B + 填充 2240B，收到 0x1000 页边界） ---- */
 	struct oplus_frame_sync_cmd cmds[OPLUS_FRAME_SYNC_CMD_RING];
+	__u8 _cmds_pad[4032 - OPLUS_FRAME_SYNC_CMD_RING * 28];
 
-	/* ---- 任务区（前端写，内核每帧现取现执行，无本地副本） ---- */
-	struct oplus_frame_sync_job jobs[OPLUS_FRAME_SYNC_JOB_MAX];
+	/* ---- 正式任务区 1MB（结果写 slots） ---- */
+	struct oplus_frame_sync_job jobs_main[OPLUS_FRAME_SYNC_JOB_MAIN];
 
-	/* ---- 一次性读邮箱（测试期探地址用） ---- */
-	struct oplus_frame_sync_mbox mbox[OPLUS_FRAME_SYNC_MBOX_SLOTS];
+	/* ---- 测试任务区 1MB（结果写 mbox 数据块） ---- */
+	struct oplus_frame_sync_job jobs_test[OPLUS_FRAME_SYNC_JOB_TEST];
 
-	/* ---- 统一数据格（A/B 双缓冲，每份最后一格 = 完成标志） ---- */
+	/* ---- mbox 订阅刷新池（测试期专用，1.25MB） ---- */
+	struct oplus_frame_sync_mbox_hdr mbox_hdr;
+	struct oplus_frame_sync_sub      subs[OPLUS_FRAME_SYNC_MBOX_SUBS];
+	struct oplus_frame_sync_mblock   mblocks[OPLUS_FRAME_SYNC_MBOX_BLOCKS];
+	__u64 _mbox_rsv[30688];   /* 245504B：mbox 区凑整 1.25MB，将来扩块数用 */
+
+	/* ---- 统一数据格（2MB，A/B 双缓冲，每份最后一格 = 完成标志） ---- */
 	struct oplus_frame_sync_slot slots[2][OPLUS_FRAME_SYNC_SLOT_MAX];
 
-	__u64 _rsv_future[448];   /* 3584B：归属魔数在起始（offsetof 自动跟随布局） */
+	__u64 _rsv_future[97792];   /* 782336B：归属魔数在起始（offsetof 自动跟随布局） */
 
 	__u32 _tail[0];
 };
@@ -218,19 +265,31 @@ OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_hdr) == 64,
 		       "uapi: hdr must be 64B");
 OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_cmd) == 28,
 		       "uapi: cmd must be 28B");
-OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_job) == 128,
-		       "uapi: job must be 128B");
-OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_slot) == 256,
-		       "uapi: slot must be 256B");
-OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_mbox) == 256,
-		       "uapi: mbox must be 256B");
+OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_job) == 1024,
+		       "uapi: job must be 1KB");
+OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_slot) == 1024,
+		       "uapi: slot must be 1KB");
+OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_mbox_hdr) == 256,
+		       "uapi: mbox_hdr must be 256B");
+OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_sub) == 16,
+		       "uapi: sub must be 16B");
+OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_mblock) == 1024,
+		       "uapi: mblock must be 1KB");
 OPLUS_FS_STATIC_ASSERT(sizeof(struct oplus_frame_sync_zone) == OPLUS_FRAME_SYNC_MAP_SIZE,
 		       "uapi: zone size must equal MAP_SIZE");
-OPLUS_FS_STATIC_ASSERT(OPLUS_FRAME_SYNC_MAGIC_OFF == 393728u,
+OPLUS_FS_STATIC_ASSERT(OPLUS_FRAME_SYNC_MAGIC_OFF == 0x541000u,
 		       "uapi: magic offset drifted");
-OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, mbox) == 66048u,
-		       "uapi: mbox offset drifted");
-OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, slots) == 131584u,
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, jobs_main) == 0x1000u,
+		       "uapi: jobs_main offset drifted");
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, jobs_test) == 0x101000u,
+		       "uapi: jobs_test offset drifted");
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, mbox_hdr) == 0x201000u,
+		       "uapi: mbox_hdr offset drifted");
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, subs) == 0x201100u,
+		       "uapi: subs offset drifted");
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, mblocks) == 0x205100u,
+		       "uapi: mblocks offset drifted");
+OPLUS_FS_STATIC_ASSERT(offsetof(struct oplus_frame_sync_zone, slots) == 0x341000u,
 		       "uapi: slots offset drifted");
 
 #endif /* _OPLUS_FRAME_SYNC_UAPI_H */
