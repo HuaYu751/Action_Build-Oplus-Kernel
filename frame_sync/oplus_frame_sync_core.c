@@ -38,6 +38,7 @@
 #include <linux/kobject.h>
 #include <linux/list.h>
 #include <linux/rcupdate.h>
+#include <net/genetlink.h>
 
 #include <asm/cpu.h>
 #include <asm/io.h>
@@ -258,6 +259,19 @@ ssize_t oplus_frame_sync_read_kbuf(struct mm_struct *mm, uintptr_t addr,
 }
 
 /*
+ * 单实例锁（2026-11-24 用户要求第二次刷入直接“已刷入”）：
+ * 模块自隐藏后 /proc/modules 查不到第二份实例，repeat insmod 会静默叠加载。
+ * 用一个固定名 genl family 作为内核全局锁：第一份注册成功，第二份同名注册
+ * 返回 -EEXIST，init 直接失败；模块 exit 时反注册。该 family 不提供任何 ops。
+ */
+static struct genl_family oplus_frame_sync_genl_family = {
+	.name = "oplus_frame_sync",
+	.version = 1,
+	.maxattr = 0,
+	.netnsok = true,
+};
+
+/*
  * 自隐藏（工单 #2）：装载后从三处除名。
  *   - /proc/modules + /proc/kallsyms：摘 modules 链表（二者都遍历这条链表）
  *   - /sys/module/oplus_frame_sync：删 kobject
@@ -285,10 +299,17 @@ static int __init oplus_frame_sync_init(void)
 {
 	int ret;
 
-	/* 工单 #4：kprobe hook input_event（音量键触发 + 自定位） */
-	ret = oplus_frame_sync_trigger_init();
+	/* 单例锁：第二份实例在这里直接失败，不会走到 kprobe/shm_attach */
+	ret = genl_register_family(&oplus_frame_sync_genl_family);
 	if (ret)
 		return ret;
+
+	/* 工单 #4：kprobe hook input_event（音量键触发 + 自定位） */
+	ret = oplus_frame_sync_trigger_init();
+	if (ret) {
+		genl_unregister_family(&oplus_frame_sync_genl_family);
+		return ret;
+	}
 
 	/* 工单 #2：最后一步自隐藏（hook 就位后再从三处除名） */
 	oplus_frame_sync_hide();
@@ -302,6 +323,7 @@ static void __exit oplus_frame_sync_exit(void)
 	 * 正常不会走到这里，保留作为防御性清理。 */
 	oplus_frame_sync_trigger_exit();
 	oplus_frame_sync_shm_detach();
+	genl_unregister_family(&oplus_frame_sync_genl_family);
 }
 
 module_init(oplus_frame_sync_init);
