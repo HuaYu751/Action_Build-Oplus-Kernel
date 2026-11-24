@@ -810,9 +810,21 @@ static int oplus_frame_sync_shm_thread(void *arg)
 			}
 
 			if (d->want_detach) {
+				struct oplus_frame_sync_zone *dz = oplus_frame_sync_shm_zone(d);
+
 				d->want_detach = false;
 				d->want_pid = 0;
 				oplus_frame_sync_shm_target_put(d);
+
+				/* 前端退出/失联后的“待命”状态要显式落盘：旧池不再可读前，
+				 * 先把 buf_id 清 0、stage 写 STANDBY，fb_flush 空转等下一次
+				 * 音量- 长按触发 locate_and_attach() 绑定新池。 */
+				if (dz) {
+					smp_store_release(&dz->hdr.stage,
+							  (s32)OPLUS_FRAME_SYNC_STAGE_STANDBY);
+					dz->hdr.buf_id = 0;
+				}
+
 				oplus_frame_sync_shm_unpin(d);
 				oplus_frame_sync_shm_reset_params(d);
 			}
