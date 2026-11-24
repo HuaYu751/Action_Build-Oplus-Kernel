@@ -133,13 +133,6 @@ static struct oplus_frame_sync_mbox_hdr *oplus_frame_sync_shm_mbox_hdr(struct op
 	return oplus_frame_sync_shm_ptr(d, off, sizeof(struct oplus_frame_sync_mbox_hdr));
 }
 
-static struct oplus_frame_sync_sub *oplus_frame_sync_shm_sub(struct oplus_frame_sync_dev *d, u32 i)
-{
-	size_t off = offsetof(struct oplus_frame_sync_zone, subs) +
-		     (size_t)(i % OPLUS_FRAME_SYNC_MBOX_SUBS) * sizeof(struct oplus_frame_sync_sub);
-	return oplus_frame_sync_shm_ptr(d, off, sizeof(struct oplus_frame_sync_sub));
-}
-
 static struct oplus_frame_sync_mblock *oplus_frame_sync_shm_mblock(struct oplus_frame_sync_dev *d, u32 i)
 {
 	size_t off = offsetof(struct oplus_frame_sync_zone, mblocks) +
